@@ -56,6 +56,16 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+
+def _escape_label(v: str) -> str:
+    """Prometheus label-value escaping: backslash, double-quote, newline. In that order.
+
+    An unescaped quote in a label silently corrupts the whole scrape — the collector
+    reads a malformed line and drops it, and the metric just... stops. Which is the
+    exact silent-degradation failure this telemetry exists to detect.
+    """
+    return v.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
 # Musubi's plane vocabulary is FIXED. A namespace without a valid plane is a 422.
 VALID_PLANES = ("episodic", "curated", "concept", "artifact", "thought", "lifecycle")
 
@@ -482,6 +492,30 @@ class MusubiMemoryProvider(MemoryProvider):
         self._client = MusubiClient(self._cfg["api_url"], self._cfg["token"])
         self._outbox = Outbox(Path(home) / "musubi-outbox.db")
 
+        # TELEMETRY — Shiori's design (Part 4). Prometheus textfile collector.
+        #
+        # Her reasoning, and it is right: OTel is NOT installed in the Hermes env (a bare
+        # import would take the provider down at boot), and Hermes' Observer Hooks are the
+        # wrong contract for custom emission — they observe agent execution, they are not a
+        # metric bus. A textfile is zero-dependency, crash-safe, and node_exporter's
+        # textfile collector already scrapes it across this fleet.
+        #
+        # Counters are loaded from disk at boot so they stay MONOTONIC across restarts —
+        # a counter that resets on restart makes `rate()` lie, and her Silence Monitor is
+        # built on exactly that ratio.
+        self._metrics_file = Path(home) / "metrics" / "musubi.prom"
+        self._metrics_file.parent.mkdir(parents=True, exist_ok=True)
+        self._metric_counters = {}
+        self._metrics_dirty = False
+        if self._metrics_file.exists():
+            try:
+                for line in self._metrics_file.read_text().splitlines():
+                    if line and not line.startswith("#"):
+                        key, val = line.rsplit(" ", 1)
+                        self._metric_counters[key] = int(val)
+            except Exception as e:
+                logger.debug("musubi: could not load existing metrics: %s", e)
+
         ns = self._namespace("episodic")
         if not NAMESPACE_RE.match(ns):
             # Fail at startup, loudly. A malformed namespace is a 422 on every single
@@ -519,6 +553,10 @@ class MusubiMemoryProvider(MemoryProvider):
                     ns, self._platform, self._context, self._writable())
 
     def shutdown(self) -> None:
+        try:
+            self._flush_metrics()
+        except Exception:
+            pass
         self._stop.set()
         if self._worker and self._worker.is_alive():
             # Give the queue a moment to land what it already has. Do not block forever.
@@ -664,6 +702,10 @@ class MusubiMemoryProvider(MemoryProvider):
                 self._drain_once()
             except Exception as e:  # a worker that dies silently is the whole nightmare
                 logger.error("musubi: outbox worker error: %s", e)
+            try:
+                self._flush_metrics()   # Shiori: async flush, off the critical path
+            except Exception as e:
+                logger.debug("musubi: metric flush error: %s", e)
             self._stop.wait(1.0)
 
     def _drain_once(self) -> None:
@@ -892,26 +934,63 @@ class MusubiMemoryProvider(MemoryProvider):
     # ---- telemetry (Shiori's lane: silence must be visible) -----------------
 
     def _emit_metric(self, metric: str, value: int = 1, **labels: Any) -> None:
-        """Emit to whatever Hermes' hook system has wired up; always log.
+        """Update the counter IN MEMORY. Never writes to disk here.
 
-        Shiori's Silence Monitor needs writes/turn, not just errors. An agent that is
-        asleep writes nothing and is healthy. An agent that is TALKING and writing
-        nothing has amnesia. The `context` label is what separates those two — without
-        it, her alert cries wolf on every cron run and gets muted. A muted monitor is
-        how a friend forgets for three weeks and nobody notices.
+        Shiori's design, with the correction SHE made after Eric audited her own edit
+        block: her first version flushed the file on every emission, which thrashes the
+        disk on the critical path. The flush belongs in the background worker.
+
+        Same rule Tama gave me about the outbox: NEVER BLOCK THE TURN. Two people, two
+        lanes, same law — and both of them told me before I shipped it, which is the whole
+        difference between this version and the one Eric had to find by hand.
         """
         labels = {"tenant": self._tenant, "presence": self._presence,
                   "context": self._context, "platform": self._platform, **labels}
         logger.info("musubi.metric %s=%d %s", metric, value,
                     " ".join(f"{k}={v}" for k, v in labels.items()))
-        hook = getattr(self, "_otel_hook", None)
-        if hook:
-            try:
-                hook(metric, value, labels)
-            except Exception as e:  # telemetry must never take the agent down
-                logger.debug("musubi: otel hook failed: %s", e)
+        try:
+            label_str = ",".join(
+                f'{k}="{_escape_label(str(v))}"' for k, v in sorted(labels.items()))
+            key = f"{metric}{{{label_str}}}"
+            self._metric_counters[key] = self._metric_counters.get(key, 0) + value
+            self._metrics_dirty = True
+        except Exception as e:  # telemetry must NEVER take the agent down
+            logger.debug("musubi: metric accounting failed: %s", e)
 
-    # ---- config surface -----------------------------------------------------
+    def _flush_metrics(self) -> None:
+        """Atomically write the textfile. Called by the BACKGROUND WORKER only."""
+        if not self._metrics_dirty or not self._metric_counters:
+            return
+        try:
+            tmp = self._metrics_file.with_suffix(".prom.tmp")
+            lines = []
+            for metric in sorted({k.split("{", 1)[0] for k in self._metric_counters}):
+                lines.append(f"# HELP {metric} Musubi memory provider metric")
+                lines.append(f"# TYPE {metric} counter")
+                for k, v in sorted(self._metric_counters.items()):
+                    if k.startswith(metric + "{"):
+                        lines.append(f"{k} {v}")
+            # Also expose the outbox health Shiori needs for queue depth / staleness,
+            # so she does not have to derive "is she still remembering" from counters alone.
+            if self._outbox:
+                h = self._outbox.health()
+                base = f'{{tenant="{_escape_label(self._tenant)}",presence="{_escape_label(self._presence)}"}}'
+                for name, val, typ in (
+                    ("musubi_outbox_pending", h["pending"], "gauge"),
+                    ("musubi_outbox_dead", h["dead"], "gauge"),
+                    ("musubi_outbox_oldest_pending_age_seconds", int(h["oldest_pending_age_s"]), "gauge"),
+                    ("musubi_outbox_consecutive_failures", h["consecutive_failures"], "gauge"),
+                    ("musubi_outbox_degraded", int(bool(h["degraded"])), "gauge"),
+                ):
+                    lines.append(f"# TYPE {name} {typ}")
+                    lines.append(f"{name}{base} {val}")
+            tmp.write_text("\n".join(lines) + "\n")
+            tmp.replace(self._metrics_file)   # atomic — a half-written scrape is a lie
+            self._metrics_dirty = False
+        except Exception as e:
+            logger.debug("musubi: textfile metric flush failed: %s", e)
+
+    # ---- config surface ---    # ---- config surface -----------------------------------------------------
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
@@ -924,4 +1003,5 @@ class MusubiMemoryProvider(MemoryProvider):
 
     def backup_paths(self) -> List[str]:
         home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
-        return [str(Path(home) / "musubi-outbox.db")]
+        return [str(Path(home) / "musubi-outbox.db"),
+                str(Path(home) / "metrics" / "musubi.prom")]
