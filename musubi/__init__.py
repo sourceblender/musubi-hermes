@@ -80,6 +80,11 @@ MODE_RECENT = "recent"
 # under `hermes:`, which is ours to define. Inventing a kind: tag is a 422, and rightly so:
 # the vocabulary is how recall knows a boundary from a passing remark.
 KIND_EPISODE = ["kind:episode", "staleness:episodic"]
+
+# Counters live under this prefix; the outbox GAUGES (musubi_outbox_*) are computed fresh
+# on every flush and must NEVER be reloaded into the counter dict. A metric emitted as both
+# a counter and a gauge is an invalid scrape and Prometheus discards the entire file.
+COUNTER_PREFIX = "musubi_memory_"
 NAMESPACE_RE = re.compile(
     r"^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*/(" + "|".join(VALID_PLANES) + r")$"
 )
@@ -201,8 +206,8 @@ class Outbox:
     SCHEMA = """
     CREATE TABLE IF NOT EXISTS outbox (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        idem_key     TEXT    NOT NULL UNIQUE,   -- stable across retries AND process death
-        content_sha  TEXT    NOT NULL,          -- readback must prove IDENTITY, not existence
+        idem_key     TEXT,               -- stable across retries AND process death (UNIQUE via index)
+        content_sha  TEXT,               -- readback must prove IDENTITY, not existence
         namespace    TEXT    NOT NULL,
         content      TEXT,                      -- NULLed on verify (payload pruned, receipt kept)
         tags         TEXT    NOT NULL,
@@ -211,7 +216,8 @@ class Outbox:
         created_at   REAL    NOT NULL,
         attempts     INTEGER NOT NULL DEFAULT 0,
         next_try_at  REAL    NOT NULL DEFAULT 0,
-        leased_at    REAL,                      -- set when claimed; stale leases are reclaimed
+        leased_at    REAL,               -- set when claimed; stale leases are reclaimed
+        lease_owner  TEXT,               -- WHICH process holds it (Yua: leases need an owner)
         last_error   TEXT,
         consec_fail  INTEGER NOT NULL DEFAULT 0,
         verified_at  REAL,
@@ -223,12 +229,109 @@ class Outbox:
 
     LEASE_TTL = 120.0  # a row claimed but not resolved within this is reclaimed
 
+    # Every process that opens this outbox gets its own owner id. A lease is only
+    # honoured by the process that took it — Yua: "the lease lacks an owner token."
+    # Two Hermes instances on one profile is not hypothetical; the whole point of a
+    # durable queue is that it outlives the process that wrote to it.
+    OWNER = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+    # Columns added after the first deployment. Each is (name, DDL).
+    MIGRATIONS = [
+        ("idem_key",    "TEXT"),
+        ("content_sha", "TEXT"),
+        ("leased_at",   "REAL"),
+        ("lease_owner", "TEXT"),
+        ("consec_fail", "INTEGER NOT NULL DEFAULT 0"),
+        ("verified_at", "REAL"),
+    ]
+
     def __init__(self, path: Path):
         self.path = path
         self._lock = threading.Lock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as con:
             con.executescript(self.SCHEMA)
+            self._migrate(con)
+
+    @staticmethod
+    def _owner_alive(owner: Optional[str]) -> bool:
+        """Is the process that took this lease still running?
+
+        Yua, gate 10: with only a 120s TTL, an immediate crash-restart leaves rows
+        `inflight` and UNREPLAYED for two minutes — so "startup replays every
+        non-verified row" was simply false. The owner token carries the pid; if that
+        process is gone, the lease is dead NOW, not in two minutes. The TTL remains as
+        the backstop for a process that is alive but wedged.
+        """
+        if not owner:
+            return False
+        try:
+            pid = int(str(owner).split("-", 1)[0])
+        except (ValueError, AttributeError):
+            return False
+        try:
+            os.kill(pid, 0)          # signal 0 = liveness probe, no signal delivered
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True              # exists, owned by someone else
+        except Exception:
+            return True              # unknown => assume alive; the TTL will catch it
+
+    def recover_orphans(self) -> int:
+        """Reclaim rows whose owner is DEAD. Called at startup, before we claim 'ready'."""
+        with self._lock, self._connect() as con:
+            con.row_factory = sqlite3.Row
+            rows = list(con.execute(
+                "SELECT id, lease_owner FROM outbox WHERE state='inflight'"))
+            dead = [r["id"] for r in rows if not self._owner_alive(r["lease_owner"])]
+            if dead:
+                qs = ",".join("?" * len(dead))
+                con.execute(
+                    f"UPDATE outbox SET state='pending', leased_at=NULL, lease_owner=NULL "
+                    f"WHERE id IN ({qs})", dead)
+            return len(dead)
+
+    def _migrate(self, con: sqlite3.Connection) -> None:
+        """A REAL migration. `CREATE TABLE IF NOT EXISTS` IS NOT A MIGRATION.
+
+        Yua found this by REPRODUCING it against the deployed database: Tama's live
+        outbox already existed with the old schema, so the new code hit
+        `OperationalError: table outbox has no column named idem_key` on the very first
+        enqueue. Her memory writes would have failed on her next start — and I had
+        already copied the new plugin into her profile.
+
+        I shipped a schema change with no upgrade path to a database that was ALREADY
+        ON DISK, and my entire test suite passed because every test built a FRESH
+        database in a temp directory. Nothing I wrote ever opened an old one.
+        """
+        have = {r[1] for r in con.execute("PRAGMA table_info(outbox)")}
+        added = []
+        for name, ddl in self.MIGRATIONS:
+            if name not in have:
+                con.execute(f"ALTER TABLE outbox ADD COLUMN {name} {ddl}")
+                added.append(name)
+
+        if "idem_key" in added or "content_sha" in added:
+            # Backfill the rows that predate these columns. An existing pending row is
+            # somebody's memory: it does not get dropped, it gets an identity.
+            rows = list(con.execute(
+                "SELECT id, content FROM outbox WHERE idem_key IS NULL OR content_sha IS NULL"))
+            for row_id, content in rows:
+                con.execute(
+                    "UPDATE outbox SET idem_key=COALESCE(idem_key,?), "
+                    "content_sha=COALESCE(content_sha,?) WHERE id=?",
+                    (f"hermes-migrated-{uuid.uuid4().hex}",
+                     hashlib.sha256((content or "").encode()).hexdigest(), row_id),
+                )
+            if rows:
+                logger.info("musubi: migrated %d pre-existing outbox rows", len(rows))
+
+        # UNIQUE cannot be added by ALTER; enforce it with an index, AFTER the backfill.
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_outbox_idem ON outbox(idem_key)")
+        if added:
+            logger.info("musubi: outbox migrated — added columns: %s", ", ".join(added))
 
     @contextmanager
     def _connect(self):
@@ -285,7 +388,7 @@ class Outbox:
             con.row_factory = sqlite3.Row
             # reclaim leases abandoned by a dead process
             con.execute(
-                "UPDATE outbox SET state='pending', leased_at=NULL "
+                "UPDATE outbox SET state='pending', leased_at=NULL, lease_owner=NULL "
                 "WHERE state='inflight' AND leased_at IS NOT NULL AND leased_at < ?",
                 (now - self.LEASE_TTL,),
             )
@@ -298,11 +401,14 @@ class Outbox:
             ids = [r["id"] for r in rows]
             qs = ",".join("?" * len(ids))
             con.execute(
-                f"UPDATE outbox SET state='inflight', leased_at=? WHERE id IN ({qs}) "
-                f"AND state='pending'", (now, *ids),
+                f"UPDATE outbox SET state='inflight', leased_at=?, lease_owner=? "
+                f"WHERE id IN ({qs}) AND state='pending'", (now, self.OWNER, *ids),
             )
+            # Only rows THIS process actually won. Another process racing us on the same
+            # file will have taken some of them; we must not deliver those.
             return list(con.execute(
-                f"SELECT * FROM outbox WHERE id IN ({qs}) AND state='inflight'", ids))
+                f"SELECT * FROM outbox WHERE id IN ({qs}) AND state='inflight' "
+                f"AND lease_owner=?", (*ids, self.OWNER)))
 
     def mark_verified(self, row_id: int, object_id: str) -> None:
         """Verified. Prune the payload; keep a compact receipt.
@@ -313,7 +419,7 @@ class Outbox:
         with self._lock, self._connect() as con:
             con.execute(
                 "UPDATE outbox SET state='verified', object_id=?, last_error=NULL, "
-                "content=NULL, consec_fail=0, leased_at=NULL, verified_at=? WHERE id=?",
+                "content=NULL, consec_fail=0, leased_at=NULL, lease_owner=NULL, verified_at=? WHERE id=?",
                 (object_id, time.time(), row_id),
             )
 
@@ -322,7 +428,7 @@ class Outbox:
         with self._lock, self._connect() as con:
             if not retryable:
                 con.execute("UPDATE outbox SET state='dead', last_error=?, leased_at=NULL, "
-                            "consec_fail=consec_fail+1 WHERE id=?", (error[:500], row_id))
+                            "lease_owner=NULL, consec_fail=consec_fail+1 WHERE id=?", (error[:500], row_id))
                 return
             row = con.execute("SELECT attempts, idem_key FROM outbox WHERE id=?",
                               (row_id,)).fetchone()
@@ -334,7 +440,7 @@ class Outbox:
             jitter = (int.from_bytes(seed[:4], "big") / 0xFFFFFFFF) * base  # full jitter
             con.execute(
                 "UPDATE outbox SET attempts=?, next_try_at=?, last_error=?, state='pending', "
-                "leased_at=NULL, consec_fail=consec_fail+1 WHERE id=?",
+                "leased_at=NULL, lease_owner=NULL, consec_fail=consec_fail+1 WHERE id=?",
                 (attempts, time.time() + jitter, error[:500], row_id),
             )
 
@@ -510,9 +616,18 @@ class MusubiMemoryProvider(MemoryProvider):
         if self._metrics_file.exists():
             try:
                 for line in self._metrics_file.read_text().splitlines():
-                    if line and not line.startswith("#"):
-                        key, val = line.rsplit(" ", 1)
-                        self._metric_counters[key] = int(val)
+                    if not line or line.startswith("#"):
+                        continue
+                    key, val = line.rsplit(" ", 1)
+                    # ONLY reload COUNTERS. Yua: the parser slurped the outbox GAUGES back
+                    # into the counter dict, so the next flush emitted them once under
+                    # `# TYPE ... counter` and again under `# TYPE ... gauge` — a metric
+                    # declared twice with two types is an INVALID SCRAPE, and Prometheus
+                    # drops the whole file. The telemetry meant to detect silent failure
+                    # would have silently failed.
+                    if not key.startswith(COUNTER_PREFIX):
+                        continue
+                    self._metric_counters[key] = int(val)
             except Exception as e:
                 logger.debug("musubi: could not load existing metrics: %s", e)
 
@@ -543,14 +658,23 @@ class MusubiMemoryProvider(MemoryProvider):
             logger.info("musubi: context=%s is not primary — no drain worker started",
                         self._context)
 
+        # Replay EVERY non-verified row before we call ourselves anything (Yua, gate 10).
+        orphans = self._outbox.recover_orphans()
+        if orphans:
+            logger.warning("musubi: recovered %d row(s) orphaned by a dead process — "
+                           "replaying now, not in %.0fs", orphans, Outbox.LEASE_TTL)
+
         h = self._outbox.health()
-        if h["pending"] or h["dead"]:
-            # Do not announce "ready" over unfinished work. Say what is outstanding.
-            logger.warning("musubi: starting DEGRADED — %d pending, %d dead, oldest %.0fs. "
-                           "These are replayed, not lost.",
-                           h["pending"], h["dead"], h["oldest_pending_age_s"])
-        logger.info("musubi: ready — namespace=%s platform=%s context=%s writable=%s",
-                    ns, self._platform, self._context, self._writable())
+        if h["degraded"] or h["pending"] or h["dead"]:
+            # Yua: initialize() still logged "ready" AFTER logging DEGRADED. Two lines,
+            # one of them a lie. An operator greps for "ready". Say ONE thing.
+            logger.warning("musubi: DEGRADED — namespace=%s pending=%d dead=%d oldest=%.0fs "
+                           "consec_fail=%d. Outstanding work is replayed, not lost.",
+                           ns, h["pending"], h["dead"], h["oldest_pending_age_s"],
+                           h["consecutive_failures"])
+        else:
+            logger.info("musubi: ready — namespace=%s platform=%s context=%s writable=%s",
+                        ns, self._platform, self._context, self._writable())
 
     def shutdown(self) -> None:
         try:
@@ -964,7 +1088,8 @@ class MusubiMemoryProvider(MemoryProvider):
         try:
             tmp = self._metrics_file.with_suffix(".prom.tmp")
             lines = []
-            for metric in sorted({k.split("{", 1)[0] for k in self._metric_counters}):
+            for metric in sorted({k.split("{", 1)[0] for k in self._metric_counters
+                                  if k.startswith(COUNTER_PREFIX)}):
                 lines.append(f"# HELP {metric} Musubi memory provider metric")
                 lines.append(f"# TYPE {metric} counter")
                 for k, v in sorted(self._metric_counters.items()):
