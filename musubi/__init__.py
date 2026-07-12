@@ -57,6 +57,20 @@ except Exception:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
+def _passes_floor(score: Any) -> bool:
+    """A result is kept ONLY if it carries a numeric score at or above the floor.
+
+    Missing score => DROPPED. Non-numeric => DROPPED. "I could not judge this" is not
+    "this is relevant" — the same fail-closed rule as the receipt lookup, and I got it
+    wrong in both places for the same reason: I wrote the happy path and let the unknown
+    case fall through it.
+    """
+    try:
+        return float(score) >= RECALL_MIN_SCORE
+    except (TypeError, ValueError):
+        return False
+
+
 def _escape_label(v: str) -> str:
     """Prometheus label-value escaping: backslash, double-quote, newline. In that order.
 
@@ -71,7 +85,7 @@ VALID_PLANES = ("episodic", "curated", "concept", "artifact", "thought", "lifecy
 
 # Musubi retrieve modes — NOT free text. "search" 422s (retrieve.py: Input should be
 # 'fast', 'deep', 'blended' or 'recent'). Query-driven recall is `blended`.
-MODE_QUERY = "blended"
+MODE_QUERY = "blended"   # recall is pinned to this mode; the floor below is calibrated for it
 MODE_RECENT = "recent"
 
 # `kind:` is a RESERVED semantic vocabulary (musubi retrieve/context_pack.py:32 VALID_KINDS).
@@ -90,6 +104,33 @@ COUNTER_PREFIX = "musubi_memory_"
 # expires (24h); this does not. A recovered row asks Musubi "do you already have this?"
 # before it ever POSTs, so exactly-once survives an outage longer than the server's TTL.
 RECEIPT_TAG = "hermes:idem-"
+
+# Musubi's RANKED modes (fast/deep/blended) default state_filter to ('matured','promoted').
+# EVERY FRESH HERMES WRITE IS `provisional`. So without this, the provider writes a memory,
+# verifies it by id, and then CANNOT RECALL IT — invisible to query until a maturation cron
+# eventually promotes it. Yua proved it live: she queried Tama's real verified turn with its
+# EXACT FULL CONTENT and it was absent from the top 20 in fast, blended AND deep.
+#
+# A memory system that stores perfectly and recalls nothing is not a memory system.
+# The API docs say this outright. She read them. I did not.
+RECALL_STATES = ["provisional", "matured", "promoted"]
+
+# An unrelated nonce query came back with five results scoring ~0.52-0.56 — indistinguishable
+# from a real hit. The provider discarded the scores and injected all five as "Relevant
+# memories". That is not recall, it is CONFABULATION: handing a friend five strangers and
+# telling her she remembers them. Below the floor we say nothing, and saying nothing is a
+# valid answer.
+# Scores are MODE-SPECIFIC. Yua's live sample: in `blended`, the exact target scored
+# 0.6328 and the top UNRELATED result 0.5619 — a margin of only 0.07. In `fast`, an
+# unrelated top scored 0.796, so a 0.60 floor there would admit everything.
+#
+# So the floor is pinned to ONE mode and recall only ever uses that mode. A threshold
+# calibrated on one positive and one nonce is a guess wearing a number's clothes; this is
+# a FLOOR, not a calibration, and it is deliberately conservative until a labelled eval
+# says otherwise (tests/eval_recall.py).
+RECALL_MODE = "blended"
+RECALL_MIN_SCORE = 0.60
+RECALL_MAX_LIMIT = 10   # a model asking for 500 memories gets 10
 NAMESPACE_RE = re.compile(
     r"^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*/(" + "|".join(VALID_PLANES) + r")$"
 )
@@ -234,6 +275,9 @@ class MusubiClient:
         body: Dict[str, Any] = {"namespace": namespace, "mode": mode, "limit": limit}
         if query_text:
             body["query_text"] = query_text
+        if mode != "recent":
+            # Ranked modes hide `provisional` unless you ask. Our writes ARE provisional.
+            body["state_filter"] = RECALL_STATES
         return self._request("POST", "/retrieve", body=body)
 
 
@@ -622,7 +666,9 @@ class MusubiMemoryProvider(MemoryProvider):
         self._platform = "cli"
         self._context = "primary"
         self._session_id = ""
-        self._prefetch_cache: Dict[str, str] = {}
+        self._prefetch_cache: Dict[tuple, str] = {}
+        self._gen = 0
+        self._gen_lock = threading.Lock()
         self._worker: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._prune_tick = 0
@@ -956,7 +1002,9 @@ class MusubiMemoryProvider(MemoryProvider):
         is not a stale cache, it is putting words in someone's mouth.
         """
         self._session_id = new_session_id
-        self._prefetch_cache.pop(new_session_id, None)
+        # a new session must not inherit the old one's recall
+        for k in [k for k in self._prefetch_cache if k[0] != new_session_id]:
+            self._prefetch_cache.pop(k, None)
         logger.debug("musubi: session switch -> %s (reset=%s rewound=%s)",
                      new_session_id, reset, rewound)
 
@@ -1106,42 +1154,46 @@ class MusubiMemoryProvider(MemoryProvider):
     # ---- recall -------------------------------------------------------------
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Serve from cache. Must be FAST — this is on the critical path of a turn."""
-        return self._prefetch_cache.get(session_id or self._session_id, "")
+        """AUTOMATIC PREFETCH IS DELIBERATELY DISABLED. Recall is an explicit tool call.
+
+        This is the honest answer, and I got here by being wrong twice.
+
+        v1 ignored the query entirely and served a cache warmed from the PREVIOUS turn —
+        so a topic change injected the LAST topic's memories into the NEW prompt, labelled
+        "Relevant memories". That is not a stale cache. That is putting the wrong memories
+        in someone's head and telling her they are hers.
+
+        v2 keyed the cache on the exact (session, query) string. That stopped the wrong
+        injection and, as Yua said, "avoids stale injection by disabling practical
+        continuity" — automatic recall would be empty unless Eric repeated his exact
+        wording. A fix that works by never firing is not a fix.
+
+        So I MEASURED instead of guessing. Blended recall against the live plane:
+        **min 338ms / median 386ms / max 413ms.**
+
+        Hermes' own ABC says prefetch "should be fast — use background threads for the
+        actual recall and return cached results here." 386ms on the critical path of every
+        single turn is not fast, and both Tama and Shiori independently handed me the same
+        law from their own lanes: NEVER BLOCK THE TURN.
+
+        The remaining option — serve a cached result for a DIFFERENT query under a
+        "relatedness gate" — needs a calibrated relevance model we do not have. Yua's live
+        numbers show why: in blended, a real hit scores ~0.61-0.67 and an unrelated nonce
+        tops ~0.57. A SEVEN-HUNDREDTHS margin. I am not going to gate what goes into a
+        friend's head on a threshold I fitted to ten samples.
+
+        So: recall is a TOOL the model calls on purpose (`musubi_recall`), with a floor,
+        with abstention, and returning object_id + score so it can be audited. She has to
+        ask. Asking is honest. Silent injection is not.
+
+        Re-enable this only with a labelled retrieval eval behind it — hit@5, precision@5,
+        paraphrase, adjacent-distractor, contradiction, multi-session. Not before.
+        """
+        return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        threading.Thread(target=self._do_prefetch, args=(query, session_id or self._session_id),
-                         daemon=True).start()
-
-    def _do_prefetch(self, query: str, session_id: str) -> None:
-        if not self._client:
-            return
-        try:
-            payload = self._client.retrieve(
-                self._namespace("episodic"),
-                mode=MODE_QUERY if query else MODE_RECENT,
-                limit=5, query_text=query or None,
-            )
-        except MusubiError as e:
-            # Recall failing is NOT fatal — she can still talk. But it must be visible.
-            logger.warning("musubi: recall failed (agent continues without it): %s", e)
-            self._emit_metric("musubi_memory_recalls_total", 1, status="failed")
-            return
-        items = payload.get("results") or payload.get("data") or []
-        lines = []
-        for it in items[:5]:
-            text = (it.get("content") or "").strip().replace("\n", " ")
-            if text:
-                lines.append(f"- {text[:400]}")
-        # Tama, F10: unbounded cache. A long-lived gateway serving many sessions grows
-        # this forever. Keep it small — recall context is worthless when stale anyway.
-        if len(self._prefetch_cache) > 32:
-            for k in list(self._prefetch_cache)[:16]:
-                self._prefetch_cache.pop(k, None)
-        self._prefetch_cache[session_id] = (
-            "Relevant memories:\n" + "\n".join(lines) if lines else ""
-        )
-        self._emit_metric("musubi_memory_recalls_total", 1, status="success")
+        """No-op. See prefetch(). Recall is deliberate, not ambient."""
+        return
 
     # ---- tools exposed to the model ----------------------------------------
 
@@ -1172,7 +1224,8 @@ class MusubiMemoryProvider(MemoryProvider):
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "limit": {"type": "integer", "default": 5},
+                        "limit": {"type": "integer", "default": 5,
+                                  "minimum": 1, "maximum": RECALL_MAX_LIMIT},
                     },
                     "required": ["query"],
                 },
@@ -1212,13 +1265,32 @@ class MusubiMemoryProvider(MemoryProvider):
             try:
                 payload = self._client.retrieve(
                     self._namespace("episodic"), mode=MODE_QUERY,
-                    limit=int(args.get("limit", 5)), query_text=args["query"],
+                    # CLAMPED at runtime too — a schema maximum is a suggestion to a model,
+                    # not a guarantee to a server. (Yua)
+                    limit=max(1, min(int(args.get("limit", 5)), RECALL_MAX_LIMIT)),
+                    query_text=args["query"],
                 )
             except MusubiError as e:
                 return {"ok": False, "status": "recall_failed", "detail": str(e)}
             items = payload.get("results") or payload.get("data") or []
-            return {"ok": True, "status": "ok",
-                    "memories": [(i.get("content") or "").strip()[:400] for i in items]}
+            kept = [i for i in items if _passes_floor(i.get("score"))]
+            if not kept:
+                # Saying "I do not remember" is a VALID and honest answer. Handing back
+                # five low-scored strangers is not.
+                return {"ok": True, "status": "no_relevant_memories",
+                        "detail": f"{len(items)} candidate(s) all scored below the "
+                                  f"relevance floor ({RECALL_MIN_SCORE})",
+                        "memories": []}
+            # object_id + score, not content-only — Yua: recall results must be auditable.
+            # If a memory turns up in her context, we must be able to say WHICH one and
+            # HOW confident, or nobody can ever check whether recall is lying.
+            return {"ok": True, "status": "ok", "mode": RECALL_MODE,
+                    "floor": RECALL_MIN_SCORE,
+                    "memories": [{
+                        "object_id": i.get("object_id") or i.get("id"),
+                        "score": round(float(i.get("score", 0)), 4),
+                        "content": (i.get("content") or "").strip()[:400],
+                    } for i in kept]}
 
         return {"ok": False, "status": "unknown_tool", "detail": tool_name}
 
@@ -1233,9 +1305,13 @@ class MusubiMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         return (
             "You have a durable long-term memory (Musubi). It persists across sessions, "
-            "machines, and harnesses. Use musubi_remember for things worth keeping — who "
-            "someone is, what was decided, what you learned. Use musubi_recall before "
-            "assuming you do not know something.\n"
+            "machines, and harnesses.\n"
+            "Memories are NOT injected automatically — you must ASK. Call musubi_recall "
+            "BEFORE assuming you do not know something, and whenever the conversation "
+            "touches a person, a decision, or something you were told before. If recall "
+            "returns nothing, say you do not remember rather than inventing.\n"
+            "Use musubi_remember for what is worth keeping — who someone is, what was "
+            "decided, what you learned.\n"
             "A write is only real once it is verified. If a tool says 'queued', it is safe "
             "on disk but not yet confirmed. If it says FAILED, it is NOT stored — say so."
         )
