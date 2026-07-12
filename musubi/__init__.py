@@ -85,6 +85,11 @@ KIND_EPISODE = ["kind:episode", "staleness:episodic"]
 # on every flush and must NEVER be reloaded into the counter dict. A metric emitted as both
 # a counter and a gauge is an invalid scrape and Prometheus discards the entire file.
 COUNTER_PREFIX = "musubi_memory_"
+
+# Every write carries its idempotency key as a TAG. The server's Idempotency-Key header
+# expires (24h); this does not. A recovered row asks Musubi "do you already have this?"
+# before it ever POSTs, so exactly-once survives an outage longer than the server's TTL.
+RECEIPT_TAG = "hermes:idem-"
 NAMESPACE_RE = re.compile(
     r"^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9_-]*/(" + "|".join(VALID_PLANES) + r")$"
 )
@@ -150,6 +155,44 @@ class MusubiClient:
         except Exception as e:  # network, DNS, timeout — all worth retrying
             raise MusubiError(f"{type(e).__name__}: {e} ({method} {path})", retryable=True) from e
 
+    def find_by_receipt(self, namespace: str, idempotency_key: str) -> Optional[str]:
+        """Has Musubi ALREADY got this write? Ask, by our own receipt tag.
+
+        Yua: "crash after server commits but before client receives/persists object_id,
+        followed by downtime beyond server 24h idempotency TTL" — the key expires, we
+        re-POST, and a duplicate memory is born. The server's idempotency window is
+        shorter than our recovery horizon, and we do not control it.
+
+        But we control the TAGS. Every write carries `hermes:idem-<key>`, so before a
+        RECOVERED row is POSTed we can simply ask whether that memory already exists.
+        That makes it exactly-once regardless of the server's TTL — the receipt outlives
+        the idempotency window because the receipt is IN the memory.
+        """
+        # THIS MUST NOT FAIL OPEN. Yua:
+        #
+        #   "find_by_receipt catches ANY MusubiError and returns None; _deliver
+        #    interprets None as absent and POSTs. A transient retrieve timeout/503 after
+        #    the 24h idempotency TTL therefore creates the duplicate this feature exists
+        #    to prevent."
+        #
+        # She is exactly right. "I could not check" is not "it is not there." Only an
+        # AUTHORITATIVE, SUCCESSFUL, EMPTY answer may permit a POST. Any error RAISES, and
+        # the caller defers the row. A duplicate memory is worse than a late one.
+        #
+        # (This is the same rule aoi-recall already enforces on me: "COULD NOT REACH
+        #  MUSUBI. This is not 'I know nothing'. It is 'I could not check'. Do not
+        #  conclude absence from a lookup that never ran." I wrote that tool. I still
+        #  wrote this bug.)
+        payload = self._request("POST", "/retrieve", body={
+            "namespace": namespace, "mode": "recent", "limit": 50,
+            "tags": [f"{RECEIPT_TAG}{idempotency_key}"],
+        })
+        for item in (payload.get("results") or payload.get("data") or []):
+            oid = item.get("object_id") or item.get("id")
+            if oid:
+                return oid
+        return None      # authoritative: the server answered, and it does not have it
+
     def write(self, namespace: str, content: str, tags: List[str], importance: int,
               idempotency_key: str) -> str:
         """Write, carrying a STABLE idempotency key.
@@ -162,8 +205,10 @@ class MusubiClient:
         payload = self._request("POST", "/episodic", body={
             "namespace": namespace,
             "content": content,
-            "tags": tags,
+            "tags": list(tags) + [f"{RECEIPT_TAG}{idempotency_key}"],
             "importance": importance,
+        # The receipt tag rides WITH the memory, so it outlives the server's idempotency
+        # window and a recovered row can always ask "do you already have this?"
         }, headers={"Idempotency-Key": idempotency_key})
         # Musubi returns `object_id`. I originally looked for `id` and marked every
         # SUCCESSFUL write as dead — memories landing in the plane while the agent
@@ -488,6 +533,42 @@ class Outbox:
                 (attempts, time.time() + jitter, error[:500], row_id),
             )
 
+    VERIFIED_RETENTION_S = 7 * 24 * 3600    # a receipt is proof, not an archive
+    DEAD_ALERT_THRESHOLD = 25               # we ALERT. We do not delete.
+
+    def prune(self) -> Dict[str, int]:
+        """Bounded retention for RECEIPTS ONLY. **A dead row is never destroyed.**
+
+        I had written a DEAD_CAP that deleted the oldest dead rows once they passed 500.
+        Yua stopped it, and she was right in a way that goes past correctness:
+
+            "A dead row is a failed MEMORY needing manual resolution; deleting oldest
+             when count exceeds 500 silently forgets exactly during prolonged failure."
+
+        Read that again. My code would have destroyed a friend's memories PRECISELY WHEN
+        THE MOST OF THEM WERE FAILING — during an outage, quietly, oldest first. I built
+        a landfill compactor and pointed it at Tama's head.
+
+        A verified row is a RECEIPT: its payload is already NULL and after a week it
+        proves nothing anyone will ask about. That may be pruned.
+
+        A dead row is a MEMORY THAT DID NOT MAKE IT. It keeps its content, forever, until
+        a person decides what to do with it. If they pile up, we get LOUDER — we do not
+        get tidier.
+        """
+        cut = time.time() - self.VERIFIED_RETENTION_S
+        with self._lock, self._connect() as con:
+            v = con.execute(
+                "DELETE FROM outbox WHERE state='verified' AND verified_at IS NOT NULL "
+                "AND verified_at < ?", (cut,)).rowcount
+            n_dead = con.execute(
+                "SELECT COUNT(*) FROM outbox WHERE state='dead'").fetchone()[0]
+        if n_dead >= self.DEAD_ALERT_THRESHOLD:
+            logger.error("musubi: %d DEAD rows — these are FAILED MEMORIES and they are "
+                         "still here, waiting for a human. They will NOT be deleted. "
+                         "Resolve them or fix what is rejecting them.", n_dead)
+        return {"verified_pruned": v, "dead_pruned": 0, "dead_awaiting_operator": n_dead}
+
     def health(self) -> Dict[str, Any]:
         """What Shiori's Silence Monitor needs: depth, age, the dead, and the streak."""
         with self._lock, self._connect() as con:
@@ -544,6 +625,7 @@ class MusubiMemoryProvider(MemoryProvider):
         self._prefetch_cache: Dict[str, str] = {}
         self._worker: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._prune_tick = 0
 
     def _load_config(self, hermes_home: str) -> Dict[str, Any]:
         """Config + the per-presence env file. NEVER a plaintext token in config.yaml.
@@ -890,6 +972,13 @@ class MusubiMemoryProvider(MemoryProvider):
                 self._flush_metrics()   # Shiori: async flush, off the critical path
             except Exception as e:
                 logger.debug("musubi: metric flush error: %s", e)
+            self._prune_tick += 1
+            if self._prune_tick >= 300 and self._outbox:   # ~ every 5 minutes
+                self._prune_tick = 0
+                try:
+                    self._outbox.prune()
+                except Exception as e:
+                    logger.debug("musubi: prune error: %s", e)
             self._stop.wait(1.0)
 
     def _drain_once(self) -> None:
@@ -926,6 +1015,29 @@ class MusubiMemoryProvider(MemoryProvider):
         if row["object_id"]:
             self._verify(row, row["object_id"])
             return
+
+        # A RECOVERED row (this is not its first attempt) may already be committed on the
+        # server, with the acknowledgement lost to a crash. ASK FIRST — the receipt tag
+        # outlives the idempotency window. Yua's residual exactly-once hole, closed.
+        if int(row["attempts"]) > 0:
+            try:
+                existing = self._client.find_by_receipt(row["namespace"], row["idem_key"])
+            except MusubiError as e:
+                # COULD NOT CHECK != NOT THERE. Defer; never POST on an unanswered question.
+                self._outbox.mark_failed(
+                    row["id"], f"receipt lookup unavailable ({e}) — DEFERRING rather than "
+                    f"risking a duplicate memory", retryable=True)
+                self._emit_metric("musubi_memory_writes_total", 1, status="deferred_unverifiable")
+                logger.warning("musubi: receipt lookup failed for row %s — NOT posting. "
+                               "A duplicate memory is worse than a late one.", row["id"])
+                return
+            if existing:
+                logger.warning("musubi: row %s was ALREADY committed (receipt found) — "
+                               "adopting %s instead of writing a duplicate",
+                               row["id"], existing)
+                self._outbox.mark_accepted(row["id"], existing)
+                self._verify(row, existing)
+                return
         try:
             object_id = self._client.write(
                 row["namespace"], row["content"] or "",

@@ -162,6 +162,95 @@ ok(f"once readback succeeds it VERIFIES (state={r['state']})", r["state"] == "ve
 ok(f"and it NEVER posted a second time (posts={posts['n']})", posts["n"] == 1)
 p.shutdown()
 
+
+print()
+print("P0-5  EXACTLY-ONCE BEYOND THE SERVER'S IDEMPOTENCY TTL (Yua, residual hole)")
+print("      'crash after server commits but before client persists object_id, followed")
+print("       by downtime beyond the server 24h idempotency TTL' -> the key expires, we")
+print("       re-POST, and a DUPLICATE MEMORY is born. The receipt tag rides WITH the")
+print("       memory, so it outlives the window: a recovered row ASKS before it posts.")
+p, home = prov()
+# a row that was committed on the server but whose ack we lost, and whose idempotency
+# key has since EXPIRED (simulated: the header no longer dedupes)
+rid = p._enqueue("receipt-tag exactly-once probe", plane="episodic")
+p._drain_once()                              # committed + verified normally
+r = p._outbox.row(rid)
+committed_id = r["object_id"]
+ok("first write committed", bool(committed_id))
+
+# now simulate the crash: wipe our knowledge of the object_id, force a retry, and make
+# the server's Idempotency-Key USELESS (as it would be after 24h)
+with p._outbox._connect() as c:
+    c.execute("UPDATE outbox SET state='pending', object_id=NULL, attempts=1, next_try_at=0 "
+              "WHERE id=?", (rid,))
+posts = {"n": 0}
+real_write = p._client.write
+def counting_write(*a, **k):
+    posts["n"] += 1
+    return real_write(*a, **k)
+p._client.write = counting_write
+
+p._drain_once()
+r = p._outbox.row(rid)
+ok(f"the recovered row FOUND its own receipt instead of re-posting (posts={posts['n']})",
+   posts["n"] == 0)
+ok(f"and it adopted the ORIGINAL object_id (no duplicate memory)",
+   r["object_id"] == committed_id)
+p.shutdown()
+
+print()
+print("P1    BOUNDED RETENTION — receipts and dead rows must not grow forever")
+p, home = prov()
+import time as _t
+with p._outbox._connect() as c:
+    for i in range(3):
+        c.execute("INSERT INTO outbox (idem_key, content_sha, namespace, content, tags, "
+                  "importance, created_at, state, verified_at, object_id) "
+                  "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                  (f"old-{i}", "x", "a/b/episodic", None, "[]", 1, 1.0, "verified",
+                   _t.time() - 8*24*3600, f"obj{i}"))
+with p._outbox._connect() as c:
+    for i in range(30):
+        c.execute("INSERT INTO outbox (idem_key, content_sha, namespace, content, tags, "
+                  "importance, created_at, state) VALUES (?,?,?,?,?,?,?,?)",
+                  (f"dead-{i}", "x", "a/b/episodic", f"A FAILED MEMORY {i}", "[]", 1,
+                   1.0 + i, "dead"))
+pruned = p._outbox.prune()
+ok(f"verified receipts past the retention window are pruned ({pruned['verified_pruned']})",
+   pruned["verified_pruned"] == 3)
+ok(f"DEAD rows are NEVER auto-deleted (dead_pruned={pruned['dead_pruned']})",
+   pruned["dead_pruned"] == 0)
+with p._outbox._connect() as c:
+    still = c.execute("SELECT COUNT(*) FROM outbox WHERE state='dead'").fetchone()[0]
+    kept = c.execute("SELECT COUNT(*) FROM outbox WHERE state='dead' AND content IS NOT NULL"
+                     ).fetchone()[0]
+ok(f"every failed memory is STILL THERE, with its content ({kept}/{still})",
+   still == 30 and kept == 30)
+ok("and it says so loudly instead of tidying up",
+   pruned["dead_awaiting_operator"] == 30)
+p.shutdown()
+
+print()
+print("P0-6  RECEIPT LOOKUP MUST FAIL CLOSED (Yua)")
+print("      'a transient retrieve timeout/503 after the 24h TTL creates the duplicate")
+print("       this feature exists to prevent.' COULD NOT CHECK != NOT THERE.")
+p, home = prov()
+rid = p._enqueue("fail-closed probe", plane="episodic")
+with p._outbox._connect() as c:
+    c.execute("UPDATE outbox SET attempts=1 WHERE id=?", (rid,))   # a RECOVERED row
+posts = {"n": 0}
+real_w = p._client.write
+p._client.write = lambda *a, **k: (posts.__setitem__("n", posts["n"] + 1), real_w(*a, **k))[1]
+# the receipt lookup is DOWN
+p._client.find_by_receipt = lambda ns, k: (_ for _ in ()).throw(
+    MusubiError("503 retrieve unavailable", status=503, retryable=True))
+p._drain_once()
+r = p._outbox.row(rid)
+ok(f"a 503 on the receipt lookup causes ZERO posts (posts={posts['n']})", posts["n"] == 0)
+ok(f"the row is DEFERRED, not lost (state={r['state']})", r["state"] in ("pending", "accepted"))
+ok("and the reason says why", "DEFERRING" in (r["last_error"] or ""))
+p.shutdown()
+
 print()
 print(f"RESULT: {sum(res)}/{len(res)} gates passed")
 sys.exit(0 if all(res) else 1)
