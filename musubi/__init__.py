@@ -42,6 +42,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -55,6 +56,11 @@ logger = logging.getLogger(__name__)
 
 # Musubi's plane vocabulary is FIXED. A namespace without a valid plane is a 422.
 VALID_PLANES = ("episodic", "curated", "concept", "artifact", "thought", "lifecycle")
+
+# Musubi retrieve modes — NOT free text. "search" 422s (retrieve.py: Input should be
+# 'fast', 'deep', 'blended' or 'recent'). Query-driven recall is `blended`.
+MODE_QUERY = "blended"
+MODE_RECENT = "recent"
 
 # `kind:` is a RESERVED semantic vocabulary (musubi retrieve/context_pack.py:32 VALID_KINDS).
 # It describes what a memory MEANS, not where it came from. A conversation turn is an
@@ -195,11 +201,29 @@ class Outbox:
         with self._connect() as con:
             con.executescript(self.SCHEMA)
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
+        """A connection that is ACTUALLY CLOSED.
+
+        `with sqlite3.connect(...) as con:` commits the transaction and LEAVES THE
+        CONNECTION OPEN — it is not a closing context manager. Every outbox operation
+        leaked a file descriptor, the worker runs every 2 seconds, and a long chat
+        exhausted the fd limit and WEDGED THE AGENT. Eric found it as "Tama locks up
+        when I try to chat with her"; Shiori, who had no plugin, was fine.
+
+        The bug that hangs the agent is not in the clever part. It is in the plumbing.
+        """
         con = sqlite3.connect(self.path, timeout=15.0)
-        con.execute("PRAGMA journal_mode=WAL")   # survive a hard kill mid-write
-        con.execute("PRAGMA synchronous=FULL")   # a memory is worth an fsync
-        return con
+        try:
+            con.execute("PRAGMA journal_mode=WAL")   # survive a hard kill mid-write
+            con.execute("PRAGMA synchronous=FULL")   # a memory is worth an fsync
+            yield con
+            con.commit()
+        except BaseException:
+            con.rollback()
+            raise
+        finally:
+            con.close()
 
     def enqueue(self, namespace: str, content: str, tags: List[str],
                 importance: int, session_id: str) -> int:
@@ -532,7 +556,7 @@ class MusubiMemoryProvider(MemoryProvider):
         try:
             payload = self._client.retrieve(
                 self._namespace("episodic"),
-                mode="search" if query else "recent",
+                mode=MODE_QUERY if query else MODE_RECENT,
                 limit=5, query_text=query or None,
             )
         except MusubiError as e:
@@ -615,7 +639,7 @@ class MusubiMemoryProvider(MemoryProvider):
                 return "memory unavailable"
             try:
                 payload = self._client.retrieve(
-                    self._namespace("episodic"), mode="search",
+                    self._namespace("episodic"), mode=MODE_QUERY,
                     limit=int(args.get("limit", 5)), query_text=args["query"],
                 )
             except MusubiError as e:
