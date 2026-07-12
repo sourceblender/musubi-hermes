@@ -88,6 +88,26 @@ results.append(ok(f"cross-tenant write marked DEAD, not retried forever (state={
                   state5 == "dead"))
 p5.shutdown()
 
+
+print()
+print("=" * 70)
+print("6. RED: session end must create NO content-free 'bookkeeping' memory")
+print("=" * 70)
+print("   Yua, from Tama's REAL db: 4 of 5 verified rows were count-only SESSION CLOSE")
+print("   records. 80% of her durable memory was my bookkeeping, and every recall query")
+print("   had to swim past it.")
+p6 = new_provider()
+import sqlite3 as _sq
+def _rows(prov):
+    with prov._outbox._connect() as c:
+        return c.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+before6 = _rows(p6)
+p6.on_session_end([{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}])
+after6 = _rows(p6)
+results.append(ok(f"session end wrote NOTHING to the outbox ({before6} -> {after6})",
+                  after6 == before6))
+p6.shutdown()
+
 print()
 print("=" * 70)
 print(f"RESULT: {sum(results)}/{len(results)} gates passed")

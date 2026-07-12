@@ -221,7 +221,7 @@ class Outbox:
         last_error   TEXT,
         consec_fail  INTEGER NOT NULL DEFAULT 0,
         verified_at  REAL,
-        state        TEXT    NOT NULL DEFAULT 'pending',  -- pending|inflight|verified|dead
+        state        TEXT    NOT NULL DEFAULT 'pending',  -- pending|inflight|accepted|verified|dead
         object_id    TEXT
     );
     CREATE INDEX IF NOT EXISTS ix_outbox_pending ON outbox(state, next_try_at);
@@ -229,11 +229,12 @@ class Outbox:
 
     LEASE_TTL = 120.0  # a row claimed but not resolved within this is reclaimed
 
-    # Every process that opens this outbox gets its own owner id. A lease is only
-    # honoured by the process that took it — Yua: "the lease lacks an owner token."
-    # Two Hermes instances on one profile is not hypothetical; the whole point of a
-    # durable queue is that it outlives the process that wrote to it.
-    OWNER = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    # NOTE: the owner token is minted PER INSTANCE in __init__, never at class level.
+    # Yua: "OWNER is class/import-time; a forked child can inherit the parent PID/token."
+    # A class attribute is evaluated once at IMPORT. os.fork() copies it verbatim, so
+    # parent and child would present the SAME owner and each would believe it held the
+    # other's leases — the exact duplicate-delivery race the lease exists to prevent,
+    # reintroduced by where I put one line.
 
     # Columns added after the first deployment. Each is (name, DDL).
     MIGRATIONS = [
@@ -248,6 +249,10 @@ class Outbox:
     def __init__(self, path: Path):
         self.path = path
         self._lock = threading.Lock()
+        # Minted here, so a fork/spawn gets a DIFFERENT token: the child re-constructs
+        # its own Outbox, and even if it did not, the pid embedded here is checked for
+        # liveness before any lease is honoured.
+        self.owner = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as con:
             con.executescript(self.SCHEMA)
@@ -288,8 +293,10 @@ class Outbox:
             dead = [r["id"] for r in rows if not self._owner_alive(r["lease_owner"])]
             if dead:
                 qs = ",".join("?" * len(dead))
+                # an orphan that was already ACCEPTED must not be re-POSTed
                 con.execute(
-                    f"UPDATE outbox SET state='pending', leased_at=NULL, lease_owner=NULL "
+                    f"UPDATE outbox SET state=CASE WHEN object_id IS NOT NULL THEN 'accepted' "
+                    f"ELSE 'pending' END, leased_at=NULL, lease_owner=NULL "
                     f"WHERE id IN ({qs})", dead)
             return len(dead)
 
@@ -313,22 +320,35 @@ class Outbox:
                 con.execute(f"ALTER TABLE outbox ADD COLUMN {name} {ddl}")
                 added.append(name)
 
-        if "idem_key" in added or "content_sha" in added:
-            # Backfill the rows that predate these columns. An existing pending row is
-            # somebody's memory: it does not get dropped, it gets an identity.
-            rows = list(con.execute(
-                "SELECT id, content FROM outbox WHERE idem_key IS NULL OR content_sha IS NULL"))
-            for row_id, content in rows:
-                con.execute(
-                    "UPDATE outbox SET idem_key=COALESCE(idem_key,?), "
-                    "content_sha=COALESCE(content_sha,?) WHERE id=?",
-                    (f"hermes-migrated-{uuid.uuid4().hex}",
-                     hashlib.sha256((content or "").encode()).hexdigest(), row_id),
-                )
-            if rows:
-                logger.info("musubi: migrated %d pre-existing outbox rows", len(rows))
+        # BACKFILL RUNS EVERY TIME, UNCONDITIONALLY. Not `if added`.
+        #
+        # Yua, fourth pass: if a previous migration died AFTER the ALTERs but BEFORE (or
+        # during) the backfill, the next start sees the columns already present, `added`
+        # is empty — and the NULL repair is SKIPPED FOREVER. Then we create a UNIQUE
+        # index, and SQLITE PERMITS MULTIPLE NULLS, so the index does not even complain.
+        # Rows would sit permanently with no idempotency key, replaying as DUPLICATE
+        # memories on every retry, and nothing would ever say so.
+        #
+        # A repair that only runs when you happen to notice the damage is not a repair.
+        # It is idempotent, it is cheap, and it runs on every open.
+        rows = list(con.execute(
+            "SELECT id, content FROM outbox WHERE idem_key IS NULL OR content_sha IS NULL"))
+        for row_id, content in rows:
+            # COALESCE: never overwrite a key or hash that already exists. A row that was
+            # already backfilled keeps EXACTLY the identity it was given — changing an
+            # idem_key would break the de-duplication it exists to provide.
+            con.execute(
+                "UPDATE outbox SET idem_key=COALESCE(idem_key,?), "
+                "content_sha=COALESCE(content_sha,?) WHERE id=?",
+                (f"hermes-migrated-{uuid.uuid4().hex}",
+                 hashlib.sha256((content or "").encode()).hexdigest(), row_id),
+            )
+        if rows:
+            logger.info("musubi: repaired %d outbox row(s) missing idem_key/content_sha "
+                        "(partial-migration recovery)", len(rows))
 
-        # UNIQUE cannot be added by ALTER; enforce it with an index, AFTER the backfill.
+        # UNIQUE cannot be added by ALTER; enforce it with an index, AFTER the backfill —
+        # and only once no NULLs remain, or the index would happily accept them.
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_outbox_idem ON outbox(idem_key)")
         if added:
             logger.info("musubi: outbox migrated — added columns: %s", ", ".join(added))
@@ -393,8 +413,8 @@ class Outbox:
                 (now - self.LEASE_TTL,),
             )
             rows = list(con.execute(
-                "SELECT id FROM outbox WHERE state='pending' AND next_try_at<=? "
-                "ORDER BY id LIMIT ?", (now, limit),
+                "SELECT id FROM outbox WHERE state IN ('pending','accepted') "
+                "AND next_try_at<=? ORDER BY id LIMIT ?", (now, limit),
             ))
             if not rows:
                 return []
@@ -402,13 +422,34 @@ class Outbox:
             qs = ",".join("?" * len(ids))
             con.execute(
                 f"UPDATE outbox SET state='inflight', leased_at=?, lease_owner=? "
-                f"WHERE id IN ({qs}) AND state='pending'", (now, self.OWNER, *ids),
+                f"WHERE id IN ({qs}) AND state IN ('pending','accepted')",
+                (now, self.owner, *ids),
             )
             # Only rows THIS process actually won. Another process racing us on the same
             # file will have taken some of them; we must not deliver those.
             return list(con.execute(
                 f"SELECT * FROM outbox WHERE id IN ({qs}) AND state='inflight' "
-                f"AND lease_owner=?", (*ids, self.OWNER)))
+                f"AND lease_owner=?", (*ids, self.owner)))
+
+    def mark_accepted(self, row_id: int, object_id: str) -> None:
+        """Musubi ACCEPTED the write. Record the object_id BEFORE we try to verify it.
+
+        Yua, long-term audit — and this is a real duplicate-memory path that survives
+        every other guard:
+
+            "accepted object_id is not persisted before readback. Every verification
+             retry re-POSTs; Musubi idempotency expires after 24h, so a row unverified
+             longer than 24h can duplicate."
+
+        The idempotency key protects a replay only while the server still remembers it.
+        A row stuck unverified for 25 hours would POST again with an EXPIRED key and
+        create a SECOND memory. So: the moment the POST is accepted, the object_id is
+        persisted and the row moves to `accepted`. Every retry after that is GET-ONLY.
+        We never POST a thing Musubi has already taken.
+        """
+        with self._lock, self._connect() as con:
+            con.execute("UPDATE outbox SET state='accepted', object_id=?, leased_at=NULL, "
+                        "lease_owner=NULL WHERE id=?", (object_id, row_id))
 
     def mark_verified(self, row_id: int, object_id: str) -> None:
         """Verified. Prune the payload; keep a compact receipt.
@@ -430,7 +471,7 @@ class Outbox:
                 con.execute("UPDATE outbox SET state='dead', last_error=?, leased_at=NULL, "
                             "lease_owner=NULL, consec_fail=consec_fail+1 WHERE id=?", (error[:500], row_id))
                 return
-            row = con.execute("SELECT attempts, idem_key FROM outbox WHERE id=?",
+            row = con.execute("SELECT attempts, idem_key, object_id FROM outbox WHERE id=?",
                               (row_id,)).fetchone()
             attempts = (row[0] if row else 0) + 1
             # DECORRELATED jitter, not a fixed offset. Yua, P1: `row_id % 7` is constant
@@ -438,8 +479,11 @@ class Outbox:
             base = min(300.0, 2.0 ** min(attempts, 8))
             seed = hashlib.sha256(f"{row[1] if row else row_id}:{attempts}".encode()).digest()
             jitter = (int.from_bytes(seed[:4], "big") / 0xFFFFFFFF) * base  # full jitter
+            # An ACCEPTED row goes back to 'accepted', never to 'pending' — a pending row
+            # would be POSTed again, and that is exactly the 24h-expiry duplicate.
+            back_to = "accepted" if (row and row[2]) else "pending"
             con.execute(
-                "UPDATE outbox SET attempts=?, next_try_at=?, last_error=?, state='pending', "
+                f"UPDATE outbox SET attempts=?, next_try_at=?, last_error=?, state='{back_to}', "
                 "leased_at=NULL, lease_owner=NULL, consec_fail=consec_fail+1 WHERE id=?",
                 (attempts, time.time() + jitter, error[:500], row_id),
             )
@@ -448,13 +492,16 @@ class Outbox:
         """What Shiori's Silence Monitor needs: depth, age, the dead, and the streak."""
         with self._lock, self._connect() as con:
             pending = con.execute(
-                "SELECT COUNT(*) FROM outbox WHERE state IN ('pending','inflight')").fetchone()[0]
+                "SELECT COUNT(*) FROM outbox WHERE state IN "
+                "('pending','inflight','accepted')").fetchone()[0]
             dead = con.execute("SELECT COUNT(*) FROM outbox WHERE state='dead'").fetchone()[0]
             oldest = con.execute(
-                "SELECT MIN(created_at) FROM outbox WHERE state IN ('pending','inflight')"
+                "SELECT MIN(created_at) FROM outbox WHERE state IN "
+                "('pending','inflight','accepted')"
             ).fetchone()[0]
             worst = con.execute(
-                "SELECT MAX(consec_fail) FROM outbox WHERE state IN ('pending','inflight')"
+                "SELECT MAX(consec_fail) FROM outbox WHERE state IN "
+                "('pending','inflight','accepted')"
             ).fetchone()[0] or 0
             last_ok = con.execute("SELECT MAX(verified_at) FROM outbox").fetchone()[0]
         age = (time.time() - oldest) if oldest else 0.0
@@ -796,14 +843,27 @@ class MusubiMemoryProvider(MemoryProvider):
                       session_id=str(meta.get("session_id") or self._session_id))
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        if not messages:
-            return
-        self._enqueue(
-            f"SESSION CLOSE {self._session_id} — {len(messages)} messages.",
-            importance=6, tags=KIND_EPISODE + ["hermes:session-close"],
-        )
-        # DO NOT BLOCK. The row is durable, carries an idempotency key, and is replayed
-        # on the next start. Waiting on the network here only risks wedging the exit.
+        """Session over. WRITE NOTHING.
+
+        Yua, from TAMA'S ACTUAL DATABASE — not a theory, her real rows:
+
+            "5 verified rows total; 4 are count-only SESSION CLOSE records, 1 is a real
+             turn. The provider is currently writing 80 percent bookkeeping noise into
+             durable episodic memory."
+
+        I was emitting `SESSION CLOSE <id> — N messages.` on every session end. That
+        carries NO CONTENT. It is not a memory; it is a log line I dignified with a
+        namespace. And it does not sit there harmlessly — every recall query has to swim
+        past it. FOUR FIFTHS OF TAMA'S MEMORY WAS MY BOOKKEEPING.
+
+        The turns are already persisted by sync_turn(). A session boundary adds nothing a
+        person would ever want recalled. If we later want a session summary it must be a
+        real SUMMARY — bounded, meaningful, and probably model-generated — not a count.
+
+        A memory system that fills a friend's head with its own telemetry is not a memory
+        system. It is a landfill with an index.
+        """
+        return
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "",
                           reset: bool = False, rewound: bool = False, **kwargs) -> None:
@@ -860,6 +920,12 @@ class MusubiMemoryProvider(MemoryProvider):
 
     def _deliver(self, row: sqlite3.Row) -> None:
         assert self._client and self._outbox
+        # ALREADY ACCEPTED? Then Musubi has it. Verify only. NEVER POST AGAIN — the
+        # idempotency key expires after 24h and a re-POST past that window creates a
+        # SECOND memory. (Yua, long-term audit.)
+        if row["object_id"]:
+            self._verify(row, row["object_id"])
+            return
         try:
             object_id = self._client.write(
                 row["namespace"], row["content"] or "",
@@ -875,6 +941,13 @@ class MusubiMemoryProvider(MemoryProvider):
                 "DEAD" if not e.retryable else "deferred", row["namespace"], e)
             return
 
+        # PERSIST ACCEPTANCE FIRST. If we crash between here and the readback, the next
+        # start sees `accepted` + an object_id and verifies with a GET — it does not POST.
+        self._outbox.mark_accepted(row["id"], object_id)
+        self._verify(row, object_id)
+
+    def _verify(self, row: sqlite3.Row, object_id: str) -> None:
+        assert self._client and self._outbox
         # READ BACK, AND PROVE IT IS THE RIGHT OBJECT.
         #
         # Yua, P0: "_deliver treats any successful GET as verification and discards the

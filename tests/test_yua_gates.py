@@ -69,15 +69,32 @@ p.shutdown()
 
 print()
 print("P0-3  PROPAGATION — a durability failure must RAISE, not be swallowed")
+print("      (Yua, third-pass audit: THIS GATE WAS VACUOUS. It called")
+print("       sync_turn(user_message=..., assistant_message=...) — the OLD, INVALID")
+print("       signature — so a TypeError fired BEFORE the injected fault was ever")
+print("       reached, and `except Exception: raised=True` counted that as a PASS.")
+print("       The gate proved nothing and I quoted it as evidence.)")
 p, home = prov()
-def boom(*a, **k): raise sqlite3.OperationalError("disk is full")
+
+called = {"n": 0}
+def boom(*a, **k):
+    called["n"] += 1
+    raise sqlite3.OperationalError("database or disk is full")
 p._outbox.enqueue = boom
-raised = False
+
+err = None
 try:
-    p.sync_turn(user_message="u", assistant_message="a")
-except Exception:
-    raised = True
-ok("sync_turn RAISES when the outbox cannot durably accept the write", raised)
+    p.sync_turn("u", "a", session_id="s")     # the REAL signature
+except Exception as e:
+    err = e
+
+ok("the injected fault was ACTUALLY REACHED (not short-circuited by a TypeError)",
+   called["n"] == 1)
+ok("sync_turn RAISES rather than swallowing", err is not None)
+ok(f"it is NOT a TypeError from a bad call ({type(err).__name__})",
+   err is not None and not isinstance(err, TypeError))
+ok("the failure that surfaces is the DISK failure",
+   err is not None and "disk is full" in str(err).lower())
 p.shutdown()
 
 print()
@@ -97,6 +114,52 @@ print()
 print("P1    NON-PRIMARY starts no worker (zero-network contract)")
 p, home = prov(context="cron")
 ok("cron starts no drain worker", p._worker is None)
+p.shutdown()
+
+
+print("P0-4  ACCEPTED-BEFORE-READBACK — a verification retry must NEVER re-POST")
+print("      (Yua, long-term audit: 'Musubi idempotency expires after 24h, so a row")
+print("       unverified longer than 24h can duplicate.' The key only protects a replay")
+print("       while the server still remembers it. A row stuck 25 hours would POST again")
+print("       with an EXPIRED key and create a SECOND memory.)")
+p, home = prov()
+posts = {"n": 0}
+real_write = p._client.write
+def counting_write(*a, **k):
+    posts["n"] += 1
+    return real_write(*a, **k)
+p._client.write = counting_write
+# make the readback fail so the row must be RETRIED
+fail = {"on": True}
+real_rb = p._client.read_back
+def flaky_rb(ns, oid):
+    if fail["on"]:
+        raise MusubiError("transient readback failure", status=503, retryable=True)
+    return real_rb(ns, oid)
+p._client.read_back = flaky_rb
+
+rid = p._enqueue("accepted-before-readback probe", plane="lifecycle")
+p._drain_once()                                   # POST ok, readback fails
+r = p._outbox.row(rid)
+ok(f"row is ACCEPTED with an object_id after the POST (state={r['state']})",
+   r["state"] == "accepted" and bool(r["object_id"]))
+ok("exactly ONE post so far", posts["n"] == 1)
+
+# force it to be retried immediately, several times
+for _ in range(3):
+    import sqlite3 as _s
+    with p._outbox._connect() as c:
+        c.execute("UPDATE outbox SET next_try_at=0 WHERE id=?", (rid,))
+    p._drain_once()
+ok(f"THREE retries later, still exactly ONE post (posts={posts['n']})", posts["n"] == 1)
+
+fail["on"] = False
+with p._outbox._connect() as c:
+    c.execute("UPDATE outbox SET next_try_at=0 WHERE id=?", (rid,))
+p._drain_once()
+r = p._outbox.row(rid)
+ok(f"once readback succeeds it VERIFIES (state={r['state']})", r["state"] == "verified")
+ok(f"and it NEVER posted a second time (posts={posts['n']})", posts["n"] == 1)
 p.shutdown()
 
 print()
