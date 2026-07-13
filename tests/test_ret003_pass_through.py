@@ -233,38 +233,63 @@ class TestRecentPassThrough(unittest.TestCase):
 
 
 class TestPluginDQF001Flagged(unittest.TestCase):
-    """DQ-001 (the 300/400 content truncation) is FLAGGED SEPARATELY; not silently cemented.
+    """DQ-001 (the 300/400 content truncation) is FLAGGED via a strict xfail.
 
-    Per Yua 2026-07-13 12:45:46 #5: 'Do not silently cement the
-    existing 300/400 content truncation: flag DQ-001 separately as
-    still open.' This test asserts the current behavior (the
-    truncation is in place) AND emits a clear DQ-001 flag in the
-    test name and the assertion message, so a future slice that
-    resolves DQ-001 must explicitly update this test.
+    Per Yua 2026-07-13 12:59:30 BLOCKER B: the prior test was a
+    normal passing assert that literally cemented the 300/400
+    content truncation. The new shape is:
+
+      - This class is marked with ``@unittest.expectedFailure``
+        (Python's equivalent of pytest's strict xfail). The test
+        SHOULD FAIL today (because the plugin currently truncates
+        content to 400 chars).
+      - The test asserts the DESIRED INVARIANT: load-bearing content
+        is NOT silently truncated (a 500-char content is preserved
+        as 500 chars).
+      - When the test fails today, ``@unittest.expectedFailure``
+        records it as EXPECTED FAILURE (xfail). The test does NOT
+        pass green.
+      - When DQ-001 is resolved (the plugin stops truncating), the
+        assertion will PASS. ``@unittest.expectedFailure`` then
+        records it as UNEXPECTED PASS (xpfail strict), which is a
+        test FAILURE -- a loud signal to consciously retire this
+        test in the same slice that fixes the bug.
+      - The test does NOT assert 400 as green; that was the bug
+        cemented by the prior shape.
+
+    A future slice that resolves DQ-001 MUST remove this test in
+    the SAME commit (not silently let it xpasse). The replacement
+    invariant is the absence of the truncation, not its presence.
     """
 
-    def test_dq_001_content_truncation_still_in_place_and_flagged(self) -> None:
-        """The current 300/400 truncation is preserved but FLAGGED as DQ-001.
+    @unittest.expectedFailure
+    def test_dq_001_load_bearing_content_not_silently_truncated(self) -> None:
+        """Load-bearing content is NOT silently truncated (DQ-001 desired invariant).
 
-        The plugin still slices content to [:400] (the historical
-        limit). A follow-up slice must resolve DQ-001 and update
-        this test to assert the new content limit (or no limit).
+        Today the plugin truncates content to 400 chars (the
+        historical limit). When the assertion FAILS, the test is
+        marked xfail (expected failure). When the truncation is
+        REMOVED, the assertion will PASS, which (with
+        ``@unittest.expectedFailure``) is an unexpected pass and
+        fails the test -- the loud signal to retire it.
         """
         p = _make_provider_with_fake_server(_fake_ranked_payload())
-        # Create a 500-char content string.
         long_content = "x" * 500
-        # Patch the fake to return the long content.
         payload = _fake_ranked_payload()
         payload["results"][0]["content"] = long_content
         p._client.retrieve = MagicMock(return_value=payload)
         out = p._tool("musubi_recall", {"query": "x", "limit": 5})
         actual = out["memories"][0]["content"]
-        # DQ-001: the plugin currently truncates to 400.
-        # This is the historical behavior; a future slice must
-        # resolve DQ-001 and update this test.
-        assert len(actual) == 400, (
-            f"DQ-001 OPEN: content is truncated to 400 chars; got {len(actual)}. "
-            f"A future slice must resolve DQ-001 and update this test."
+        # DESIRED INVARIANT: a 500-char input is preserved as 500
+        # chars (NOT silently truncated to 400). The test fails
+        # today (the plugin truncates); when the bug is fixed, the
+        # test passes -- which is an unexpected pass with
+        # @unittest.expectedFailure and signals the test must be
+        # retired.
+        assert actual == long_content, (
+            f"DQ-001 OPEN: load-bearing content is silently truncated. "
+            f"Input 500 chars; got {len(actual)}. Fix DQ-001 and retire "
+            f"this test in the same commit."
         )
 
 
