@@ -13,7 +13,8 @@ cd "$(dirname "$0")/.."
 fail=0
 
 for t in tests/test_write_path.py tests/test_yua_gates.py \
-         tests/test_upgrade_and_recovery.py tests/test_lease_contention.py; do
+         tests/test_upgrade_and_recovery.py tests/test_lease_contention.py \
+         tests/test_ret003_pass_through.py; do
   echo "════════ $t"
   out="$(python3 "$t" 2>&1)"; status=$?      # RUN ONCE. Capture. Preserve the status.
   echo "$out" | grep -E 'PASS|FAIL|RESULT' || true
