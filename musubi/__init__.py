@@ -1236,6 +1236,59 @@ class MusubiMemoryProvider(MemoryProvider):
         """MUST RETURN A JSON STRING (memory_provider.py:144-149). Mine returned prose."""
         return json.dumps(self._tool(tool_name, args, **kwargs))
 
+    def _transform_musubi_row(self, item: dict) -> dict:
+        """Transform one Musubi wire row into the Hermes pass-through shape.
+
+        RET-003 wire pass-through conformance (per Yua 2026-07-13
+        12:45:46 #5): the plugin MUST preserve the following fields
+        from the Musubi wire response without fabrication:
+
+          - object_id: the LOGICAL KSUID (the wire field). The
+            physical Qdrant point id is a distinct UUID translation
+            (episodic_point_id); the wire carries the KSUID.
+          - score: float (ranked: combined; recent: created_epoch).
+          - plane: "episodic" | "curated" | "concept" | "artifact"
+            (was being STRIPPED before this commit).
+          - namespace: the 3-segment namespace (was being STRIPPED).
+          - state: LifecycleState | null (nullable for missing legacy;
+            was being STRIPPED).
+          - importance: int 1..10 | null (nullable for missing legacy;
+            was being STRIPPED).
+          - score_kind: "ranked_combined" | "created_epoch" (was
+            being STRIPPED).
+          - provenance_score: float 0..1 | null (recent only; was
+            being STRIPPED).
+          - extra.score_components: dict (ranked: 5 keys; recent:
+            exact {}; was being STRIPPED).
+          - content: the snippet (DQ-001: the 300/400 content
+            truncation is FLAGGED SEPARATELY; this commit does NOT
+            silently cement the truncation).
+
+        The plugin does NOT fabricate values: missing legacy payload
+        fields render as null, NOT as defaults. DQ-001 (the 300/400
+        content truncation) is still open and a follow-up slice
+        will resolve it.
+        """
+        out: dict = {
+            "object_id": item.get("object_id") or item.get("id"),
+            "score": round(float(item.get("score", 0)), 4),
+            "content": (item.get("content") or "").strip()[:400],  # DQ-001
+        }
+        for wire_field in (
+            "plane",
+            "namespace",
+            "state",
+            "importance",
+            "score_kind",
+            "provenance_score",
+        ):
+            if wire_field in item:
+                out[wire_field] = item[wire_field]
+        extra = item.get("extra")
+        if isinstance(extra, dict) and "score_components" in extra:
+            out["extra"] = {"score_components": extra["score_components"]}
+        return out
+
     def _tool(self, tool_name: str, args: Dict[str, Any], **kwargs) -> Dict[str, Any]:
         if tool_name == "musubi_remember":
             if not self._writable():
@@ -1286,11 +1339,7 @@ class MusubiMemoryProvider(MemoryProvider):
             # HOW confident, or nobody can ever check whether recall is lying.
             return {"ok": True, "status": "ok", "mode": RECALL_MODE,
                     "floor": RECALL_MIN_SCORE,
-                    "memories": [{
-                        "object_id": i.get("object_id") or i.get("id"),
-                        "score": round(float(i.get("score", 0)), 4),
-                        "content": (i.get("content") or "").strip()[:400],
-                    } for i in kept]}
+                    "memories": [self._transform_musubi_row(i) for i in kept]}
 
         return {"ok": False, "status": "unknown_tool", "detail": tool_name}
 
