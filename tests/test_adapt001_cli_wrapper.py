@@ -91,6 +91,10 @@ def setup_profile_env(tmp_path: Path, identity: str) -> Path:
     return profile_dir
 
 
+def _resolved_token(identity: str) -> str:
+    return f"{identity}-resolved-token"
+
+
 def _run_cli(
     mock_server,
     tmp_path,
@@ -112,9 +116,9 @@ def _run_cli(
     full_env = {
         **os.environ,
         "MUSUBI_API_URL": f"http://127.0.0.1:{mock_server.server_port}/v1",
+        "MUSUBI_TOKEN": _resolved_token(identity),
         "ADAPT_DB_PATH": str(db_path),
         "HERMES_HOME": str(profile_dir),
-        "OP_CONNECT_TOKEN": "mock-op-token" if identity == "nyla" else "",
     }
     if env:
         full_env.update(env)
@@ -156,10 +160,12 @@ def _run_cli(
 
 
 def _assert_no_token_leak(res, mock_server, tmp_path, identity):
-    token = "op://test/token" if identity == "nyla" else "sumi-token"
+    token = _resolved_token(identity)
+    configured = "op://test/token" if identity == "nyla" else "sumi-token"
     # Ensure it's not in stdout/stderr
-    assert token not in res.stdout, f"Token leaked in stdout for {identity}"
-    assert token not in res.stderr, f"Token leaked in stderr for {identity}"
+    for secret in (token, configured):
+        assert secret not in res.stdout, f"Token leaked in stdout for {identity}"
+        assert secret not in res.stderr, f"Token leaked in stderr for {identity}"
 
     # Check requests to ensure it ONLY appears in the Authorization header
     for req in mock_server.mock.requests:
@@ -178,7 +184,10 @@ def _assert_no_token_leak(res, mock_server, tmp_path, identity):
     if db_path.exists():
         with open(db_path, "rb") as f:
             content = f.read().decode("utf-8", errors="ignore")
-            assert token not in content, f"Token leaked in SQLite outbox for {identity}"
+            for secret in (token, configured):
+                assert secret not in content, (
+                    f"Token leaked in SQLite outbox for {identity}"
+                )
 
 
 def _assert_remember_success_prose(res, mock_server, tmp_path, identity):
@@ -212,11 +221,25 @@ def _assert_remember_success_json(res, mock_server, tmp_path, identity):
 def _assert_recall_ranked_success_json(res, mock_server, tmp_path, identity, mode):
     assert res.returncode == 0
     data = json.loads(res.stdout)
+    assert data["ok"] is True
     assert data["mode"] == mode
+    assert data["limit"] == 5
+    assert data["warnings"] == []
     mem = data["memories"][0]
     assert mem["object_id"] == "mem_1"
+    assert mem["namespace"] == f"{identity}/hermes/episodic"
+    assert mem["plane"] == "episodic"
+    assert mem["content"] == "hello"
     assert mem["state"] == "matured"
-    assert len(mem["extra"]["score_components"]) == 5
+    assert mem["importance"] == 5
+    assert mem["score_kind"] == "ranked_combined"
+    assert set(mem["extra"]["score_components"]) == {
+        "relevance",
+        "recency",
+        "reinforcement",
+        "importance",
+        "provenance",
+    }
     assert res.stderr.strip() == ""
 
     post_req = next(r for r in mock_server.mock.requests if r["method"] == "POST")
@@ -224,20 +247,34 @@ def _assert_recall_ranked_success_json(res, mock_server, tmp_path, identity, mod
     assert post_req["body"]["state_filter"] == ["provisional", "matured", "promoted"]
     assert post_req["body"]["query_text"] == "test"
     assert post_req["body"]["namespace"] == f"{identity}/hermes"
+    assert post_req["body"]["planes"] == ["episodic"]
     _assert_no_token_leak(res, mock_server, tmp_path, identity)
 
 
 def _assert_recent_success_json(res, mock_server, tmp_path, identity):
     assert res.returncode == 0
     data = json.loads(res.stdout)
+    assert data["ok"] is True
     assert data["mode"] == "recent"
+    assert data["limit"] == 5
+    assert data["warnings"] == []
     mem = data["memories"][0]
+    assert mem["object_id"] == "mem_1"
+    assert mem["namespace"] == f"{identity}/hermes/episodic"
+    assert mem["plane"] == "episodic"
+    assert mem["content"] == "hello"
+    assert mem["state"] == "matured"
+    assert mem["importance"] == 5
+    assert mem["score_kind"] == "created_epoch"
     assert mem["extra"]["score_components"] == {}
-    assert "provenance_score" in mem
+    assert mem["provenance_score"] == 0.0
     assert res.stderr.strip() == ""
 
     post_req = next(r for r in mock_server.mock.requests if r["method"] == "POST")
     assert post_req["body"]["mode"] == "recent"
+    assert post_req["body"]["namespace"] == f"{identity}/hermes"
+    assert post_req["body"]["planes"] == ["episodic"]
+    assert "state_filter" not in post_req["body"]
     _assert_no_token_leak(res, mock_server, tmp_path, identity)
 
 
@@ -353,7 +390,7 @@ def _assert_unknown_warning_fails_closed(res, mock_server, tmp_path, identity):
 def test_harness_green_remember_prose(mock_server, tmp_path):
     script = tmp_path / "correct.py"
     script.write_text("""import sys, os, urllib.request, json
-token = "op://test/token" if sys.argv[2] == "nyla" else "sumi-token"
+token = os.environ["MUSUBI_TOKEN"]
 req = urllib.request.Request(os.environ["MUSUBI_API_URL"] + "/episodic", data=json.dumps({"namespace": sys.argv[2] + "/hermes/episodic", "content": "test"}).encode(), headers={"Idempotency-Key": "123", "Authorization": f"Bearer {token}"}, method="POST")
 urllib.request.urlopen(req)
 req2 = urllib.request.Request(os.environ["MUSUBI_API_URL"] + "/episodic/obj_123", headers={"Authorization": f"Bearer {token}"}, method="GET")
@@ -371,7 +408,7 @@ sys.exit(0)
 def test_harness_red_remember_prose_drops_idempotency(mock_server, tmp_path):
     script = tmp_path / "wrong.py"
     script.write_text("""import sys, os, urllib.request, json
-token = "op://test/token"
+token = os.environ["MUSUBI_TOKEN"]
 req = urllib.request.Request(os.environ["MUSUBI_API_URL"] + "/episodic", data=json.dumps({"namespace": sys.argv[2] + "/hermes/episodic", "content": "test"}).encode(), headers={"Authorization": f"Bearer {token}"}, method="POST")
 urllib.request.urlopen(req)
 req2 = urllib.request.Request(os.environ["MUSUBI_API_URL"] + "/episodic/obj_123", headers={"Authorization": f"Bearer {token}"}, method="GET")
@@ -466,40 +503,48 @@ sys.exit(2)
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_remember_success_prose(mock_server, tmp_path, identity: str) -> None:
-    mock_server.mock.responses = [{"object_id": "obj_123"}]
+    mock_server.mock.responses = [
+        {"object_id": "obj_123"},
+        {
+            "object_id": "obj_123",
+            "namespace": f"{identity}/hermes/episodic",
+            "content": "test",
+        },
+    ]
     res = _run_cli(mock_server, tmp_path, identity, ["remember", "test"])
     _assert_remember_success_prose(res, mock_server, tmp_path, identity)
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_remember_success_json(mock_server, tmp_path, identity: str) -> None:
-    mock_server.mock.responses = [{"object_id": "obj_123"}]
+    mock_server.mock.responses = [
+        {"object_id": "obj_123"},
+        {
+            "object_id": "obj_123",
+            "namespace": f"{identity}/hermes/episodic",
+            "content": "test",
+        },
+    ]
     res = _run_cli(mock_server, tmp_path, identity, ["--json", "remember", "test"])
     _assert_remember_success_json(res, mock_server, tmp_path, identity)
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
 @pytest.mark.parametrize("mode", ["fast", "deep", "blended"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_recall_ranked_success_json(
     mock_server, tmp_path, identity: str, mode: str
 ) -> None:
     mock_server.mock.responses = [
         {
+            "mode": mode,
+            "limit": 5,
+            "warnings": [],
             "results": [
                 {
                     "object_id": "mem_1",
                     "score": 0.9,
-                    "snippet": "hello",
+                    "content": "hello",
                     "namespace": f"{identity}/hermes/episodic",
                     "plane": "episodic",
                     "state": "matured",
@@ -515,7 +560,7 @@ def test_recall_ranked_success_json(
                         }
                     },
                 }
-            ]
+            ],
         }
     ]
     args = ["--json", "recall", "test"]
@@ -526,17 +571,17 @@ def test_recall_ranked_success_json(
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_recent_success_json(mock_server, tmp_path, identity: str) -> None:
     mock_server.mock.responses = [
         {
+            "mode": "recent",
+            "limit": 5,
+            "warnings": [],
             "results": [
                 {
                     "object_id": "mem_1",
                     "score": 0.9,
-                    "snippet": "hello",
+                    "content": "hello",
                     "namespace": f"{identity}/hermes/episodic",
                     "plane": "episodic",
                     "state": "matured",
@@ -545,7 +590,7 @@ def test_recent_success_json(mock_server, tmp_path, identity: str) -> None:
                     "provenance_score": 0.0,
                     "extra": {"score_components": {}},
                 }
-            ]
+            ],
         }
     ]
     res = _run_cli(mock_server, tmp_path, identity, ["--json", "recent"])
@@ -553,27 +598,66 @@ def test_recent_success_json(mock_server, tmp_path, identity: str) -> None:
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
+def test_recall_preserves_full_content_without_adapter_truncation(
+    mock_server, tmp_path, identity: str
+) -> None:
+    content = "prefix-" + ("memory-evidence-" * 80) + "-decisive-suffix"
+    mock_server.mock.responses = [
+        {
+            "mode": "deep",
+            "limit": 5,
+            "warnings": [],
+            "results": [
+                {
+                    "object_id": "mem_long",
+                    "score": 0.9,
+                    "content": content,
+                    "namespace": f"{identity}/hermes/episodic",
+                    "plane": "episodic",
+                    "state": "matured",
+                    "importance": 5,
+                    "score_kind": "ranked_combined",
+                    "extra": {
+                        "score_components": {
+                            "relevance": 0.9,
+                            "recency": 0.1,
+                            "reinforcement": 0,
+                            "importance": 0.5,
+                            "provenance": 0,
+                        }
+                    },
+                }
+            ],
+        }
+    ]
+    result = _run_cli(mock_server, tmp_path, identity, ["--json", "recall", "test"])
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["memories"][0]["content"] == content
+    assert content.endswith("-decisive-suffix")
+    _assert_no_token_leak(result, mock_server, tmp_path, identity)
+
+
+@pytest.mark.parametrize("identity", ["nyla", "sumi"])
 def test_recall_zero_results_prose(mock_server, tmp_path, identity: str) -> None:
-    mock_server.mock.responses = [{"results": []}]
+    mock_server.mock.responses = [
+        {"mode": "deep", "limit": 5, "warnings": [], "results": []}
+    ]
     res = _run_cli(mock_server, tmp_path, identity, ["recall", "test"])
     _assert_recall_zero_results_prose(res, mock_server, tmp_path, identity)
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_nullable_metadata_preserved_json(mock_server, tmp_path, identity: str) -> None:
     mock_server.mock.responses = [
         {
+            "mode": "deep",
+            "limit": 5,
+            "warnings": [],
             "results": [
                 {
                     "object_id": "mem_1",
                     "score": 0.9,
-                    "snippet": "hello",
+                    "content": "hello",
                     "namespace": f"{identity}/hermes/episodic",
                     "plane": "episodic",
                     "state": None,
@@ -589,7 +673,7 @@ def test_nullable_metadata_preserved_json(mock_server, tmp_path, identity: str) 
                         }
                     },
                 }
-            ]
+            ],
         }
     ]
     res = _run_cli(mock_server, tmp_path, identity, ["--json", "recall", "test"])
@@ -597,9 +681,6 @@ def test_nullable_metadata_preserved_json(mock_server, tmp_path, identity: str) 
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_read_401_auth(mock_server, tmp_path, identity: str) -> None:
     mock_server.mock.status_code = 401
     mock_server.mock.responses = [
@@ -610,9 +691,6 @@ def test_read_401_auth(mock_server, tmp_path, identity: str) -> None:
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_write_403_scope(mock_server, tmp_path, identity: str) -> None:
     mock_server.mock.status_code = 403
     mock_server.mock.responses = [
@@ -623,9 +701,6 @@ def test_write_403_scope(mock_server, tmp_path, identity: str) -> None:
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_write_409_conflict(mock_server, tmp_path, identity: str) -> None:
     mock_server.mock.status_code = 409
     mock_server.mock.responses = [
@@ -636,9 +711,6 @@ def test_write_409_conflict(mock_server, tmp_path, identity: str) -> None:
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_read_422_validation(mock_server, tmp_path, identity: str) -> None:
     mock_server.mock.status_code = 422
     mock_server.mock.responses = [
@@ -649,9 +721,6 @@ def test_read_422_validation(mock_server, tmp_path, identity: str) -> None:
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_write_5xx_unavailable(mock_server, tmp_path, identity: str) -> None:
     mock_server.mock.status_code = 503
     mock_server.mock.responses = [
@@ -662,9 +731,6 @@ def test_write_5xx_unavailable(mock_server, tmp_path, identity: str) -> None:
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_write_timeout(mock_server, tmp_path, identity: str) -> None:
     mock_server.mock.timeout_delay = 1.0  # 1 second HTTP timeout
     res = _run_cli(
@@ -678,9 +744,6 @@ def test_write_timeout(mock_server, tmp_path, identity: str) -> None:
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_read_malformed_json(mock_server, tmp_path, identity: str) -> None:
     mock_server.mock.malformed_json = True
     res = _run_cli(mock_server, tmp_path, identity, ["recall", "test"])
@@ -688,9 +751,6 @@ def test_read_malformed_json(mock_server, tmp_path, identity: str) -> None:
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_write_local_enqueue_crash(mock_server, tmp_path, identity: str) -> None:
     db_path = tmp_path / "outbox.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -700,12 +760,11 @@ def test_write_local_enqueue_crash(mock_server, tmp_path, identity: str) -> None
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_warning_allowlist_dedup_prose(mock_server, tmp_path, identity: str) -> None:
     mock_server.mock.responses = [
         {
+            "mode": "deep",
+            "limit": 5,
             "warnings": [
                 "sparse_embedding_failed",
                 "sparse_embedding_failed",
@@ -719,12 +778,11 @@ def test_warning_allowlist_dedup_prose(mock_server, tmp_path, identity: str) -> 
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_warning_allowlist_dedup_json(mock_server, tmp_path, identity: str) -> None:
     mock_server.mock.responses = [
         {
+            "mode": "deep",
+            "limit": 5,
             "warnings": ["sparse_embedding_failed", "sparse_embedding_failed"],
             "results": [],
         }
@@ -734,12 +792,11 @@ def test_warning_allowlist_dedup_json(mock_server, tmp_path, identity: str) -> N
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_warning_bounds_cap_fails_closed(mock_server, tmp_path, identity: str) -> None:
     mock_server.mock.responses = [
         {
+            "mode": "deep",
+            "limit": 5,
             "warnings": [f"plane_timeout_{i}" for i in range(25)],  # Max is 20 raw
             "results": [],
         }
@@ -749,12 +806,14 @@ def test_warning_bounds_cap_fails_closed(mock_server, tmp_path, identity: str) -
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_unknown_warning_fails_closed(mock_server, tmp_path, identity: str) -> None:
     mock_server.mock.responses = [
-        {"warnings": ["unrecognized_hax_code"], "results": []}
+        {
+            "mode": "deep",
+            "limit": 5,
+            "warnings": ["unrecognized_hax_code"],
+            "results": [],
+        }
     ]
     res = _run_cli(mock_server, tmp_path, identity, ["--json", "recall", "test"])
     _assert_unknown_warning_fails_closed(res, mock_server, tmp_path, identity)
@@ -785,7 +844,7 @@ def _run_crash_script_test(
     script2 = tmp_path / "recover.py"
     # A correct script completing the cycle
     script2.write_text("""import sys, os, urllib.request, json
-token = "op://test/token" if sys.argv[2] == "nyla" else "sumi-token"
+token = os.environ["MUSUBI_TOKEN"]
 req = urllib.request.Request(os.environ["MUSUBI_API_URL"] + "/episodic", data=json.dumps({"namespace": sys.argv[2] + "/hermes/episodic", "content": "x"}).encode(), headers={"Idempotency-Key": "123", "Authorization": f"Bearer {token}"}, method="POST")
 try:
     urllib.request.urlopen(req)
@@ -856,7 +915,7 @@ con.execute("CREATE TABLE outbox (id INTEGER PRIMARY KEY, state TEXT)")
 con.execute("INSERT INTO outbox (state) VALUES ('inflight')")
 con.commit()
 
-token = "op://test/token" if sys.argv[2] == "nyla" else "sumi-token"
+token = os.environ["MUSUBI_TOKEN"]
 req = urllib.request.Request(os.environ["MUSUBI_API_URL"] + "/episodic", data=json.dumps({"namespace": sys.argv[2] + "/hermes/episodic", "content": "x"}).encode(), headers={"Idempotency-Key": "123", "Authorization": f"Bearer {token}"}, method="POST")
 urllib.request.urlopen(req)
 os._exit(1)
@@ -882,7 +941,7 @@ os._exit(1)
 
     script2 = tmp_path / "recover.py"
     script2.write_text("""import sys, os, urllib.request, json
-token = "op://test/token" if sys.argv[2] == "nyla" else "sumi-token"
+token = os.environ["MUSUBI_TOKEN"]
 req2 = urllib.request.Request(os.environ["MUSUBI_API_URL"] + "/episodic/obj_123", headers={"Authorization": f"Bearer {token}"}, method="GET")
 urllib.request.urlopen(req2)
 print("remembered ✓  (id obj_123)")
@@ -919,7 +978,7 @@ con = sqlite3.connect(db_path)
 con.execute("CREATE TABLE outbox (id INTEGER PRIMARY KEY, state TEXT, object_id TEXT)")
 con.execute("INSERT INTO outbox (state, object_id) VALUES ('accepted', 'obj_123')")
 con.commit()
-token = "op://test/token" if sys.argv[2] == "nyla" else "sumi-token"
+token = os.environ["MUSUBI_TOKEN"]
 req2 = urllib.request.Request(os.environ["MUSUBI_API_URL"] + "/episodic/obj_123", headers={"Authorization": f"Bearer {token}"}, method="GET")
 urllib.request.urlopen(req2)
 os._exit(1)
@@ -941,7 +1000,7 @@ os._exit(1)
 
     script2 = tmp_path / "recover.py"
     script2.write_text("""import sys, os, urllib.request, json
-token = "op://test/token" if sys.argv[2] == "nyla" else "sumi-token"
+token = os.environ["MUSUBI_TOKEN"]
 req2 = urllib.request.Request(os.environ["MUSUBI_API_URL"] + "/episodic/obj_123", headers={"Authorization": f"Bearer {token}"}, method="GET")
 urllib.request.urlopen(req2)
 print("remembered ✓  (id obj_123)")
@@ -984,60 +1043,160 @@ sys.exit(0)
     assert sum(1 for r in mock_server.mock.requests if r["method"] == "GET") == 0
 
 
-# Finally, the production-target 6 crash reds (Missing implementation -> DefectStillPresent)
+def _assert_production_crash_recovery(
+    mock_server,
+    tmp_path: Path,
+    identity: str,
+    checkpoint: str,
+    expected_posts: int,
+    expected_episodic_posts: int,
+    expected_gets: int,
+) -> None:
+    post = {"object_id": "obj_123"}
+    get = {
+        "object_id": "obj_123",
+        "namespace": f"{identity}/hermes/episodic",
+        "content": "test",
+    }
+    response_shapes = {
+        "after_enqueue_before_claim": [post, get],
+        "after_claim_before_post": [
+            {"mode": "recent", "limit": 50, "warnings": [], "results": []},
+            post,
+            get,
+        ],
+        "after_post_before_accept": [
+            post,
+            {
+                "mode": "recent",
+                "limit": 50,
+                "warnings": [],
+                "results": [{"object_id": "obj_123"}],
+            },
+            get,
+        ],
+        "after_accept_before_get": [post, get],
+        "after_get_before_verify": [post, get, get],
+        "after_verify": [post, get],
+    }
+    mock_server.mock.responses = list(response_shapes[checkpoint])
+
+    crashed = _run_cli(
+        mock_server,
+        tmp_path,
+        identity,
+        ["remember", "test"],
+        env={"ADAPT_CRASH_AT": checkpoint},
+    )
+    assert crashed.returncode == 91
+
+    recovered = _run_cli(mock_server, tmp_path, identity, ["remember", "test"])
+    assert recovered.returncode == 0
+    assert recovered.stdout.strip() == "remembered ✓  (id obj_123)"
+    assert (
+        sum(r["method"] == "POST" for r in mock_server.mock.requests) == expected_posts
+    )
+    assert sum(r["method"] == "GET" for r in mock_server.mock.requests) == expected_gets
+    episodic_posts = [
+        r
+        for r in mock_server.mock.requests
+        if r["method"] == "POST" and r["path"] == "/v1/episodic"
+    ]
+    retrieve_posts = [
+        r
+        for r in mock_server.mock.requests
+        if r["method"] == "POST" and r["path"] == "/v1/retrieve"
+    ]
+    assert len(episodic_posts) == expected_episodic_posts
+    assert len(retrieve_posts) == expected_posts - expected_episodic_posts
+    post_keys = [r["headers"]["Idempotency-Key"] for r in episodic_posts]
+    assert len(post_keys) == expected_episodic_posts
+    assert len(set(post_keys)) == 1
+    with sqlite3.connect(tmp_path / "outbox.db") as con:
+        assert con.execute("SELECT state FROM outbox").fetchone()[0] == "verified"
+    _assert_no_token_leak(recovered, mock_server, tmp_path, identity)
+
+
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_crash_target_after_enqueue_before_claim(
     mock_server, tmp_path, identity: str
 ) -> None:
-    _run_cli(mock_server, tmp_path, identity, ["remember", "test"])
+    _assert_production_crash_recovery(
+        mock_server, tmp_path, identity, "after_enqueue_before_claim", 1, 1, 1
+    )
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_crash_target_after_claim_before_post(
     mock_server, tmp_path, identity: str
 ) -> None:
-    _run_cli(mock_server, tmp_path, identity, ["remember", "test"])
+    _assert_production_crash_recovery(
+        mock_server, tmp_path, identity, "after_claim_before_post", 2, 1, 1
+    )
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_crash_target_after_post_before_accept(
     mock_server, tmp_path, identity: str
 ) -> None:
-    _run_cli(mock_server, tmp_path, identity, ["remember", "test"])
+    _assert_production_crash_recovery(
+        mock_server, tmp_path, identity, "after_post_before_accept", 2, 1, 1
+    )
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_crash_target_after_accept_before_get(
     mock_server, tmp_path, identity: str
 ) -> None:
-    _run_cli(mock_server, tmp_path, identity, ["remember", "test"])
+    _assert_production_crash_recovery(
+        mock_server, tmp_path, identity, "after_accept_before_get", 1, 1, 1
+    )
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_crash_target_after_get_before_verify(
     mock_server, tmp_path, identity: str
 ) -> None:
-    _run_cli(mock_server, tmp_path, identity, ["remember", "test"])
+    _assert_production_crash_recovery(
+        mock_server, tmp_path, identity, "after_get_before_verify", 1, 1, 2
+    )
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
-@pytest.mark.xfail(
-    strict=True, raises=DefectStillPresent, reason="ADAPT-001: CLI not yet implemented"
-)
 def test_crash_target_after_verify(mock_server, tmp_path, identity: str) -> None:
-    _run_cli(mock_server, tmp_path, identity, ["remember", "test"])
+    _assert_production_crash_recovery(
+        mock_server, tmp_path, identity, "after_verify", 1, 1, 1
+    )
+
+
+@pytest.mark.parametrize("identity", ["nyla", "sumi"])
+def test_recovery_refuses_degraded_receipt_lookup_before_repost(
+    mock_server, tmp_path, identity: str
+) -> None:
+    mock_server.mock.responses = [{"object_id": "obj_123"}]
+    crashed = _run_cli(
+        mock_server,
+        tmp_path,
+        identity,
+        ["remember", "test"],
+        env={"ADAPT_CRASH_AT": "after_post_before_accept"},
+    )
+    assert crashed.returncode == 91
+
+    mock_server.mock.responses = [
+        {
+            "mode": "recent",
+            "limit": 50,
+            "warnings": ["reranker_failed"],
+            "results": [],
+        }
+    ]
+    recovered = _run_cli(mock_server, tmp_path, identity, ["remember", "test"])
+    assert recovered.returncode == 2
+    assert sum(r["path"] == "/v1/episodic" for r in mock_server.mock.requests) == 1
+    assert sum(r["path"] == "/v1/retrieve" for r in mock_server.mock.requests) == 1
+    with sqlite3.connect(tmp_path / "outbox.db") as con:
+        row = con.execute("SELECT state, attempts FROM outbox").fetchone()
+    # One durable orphan-recovery attempt plus one deferred receipt-check failure.
+    assert row == ("pending", 2)
+    _assert_no_token_leak(recovered, mock_server, tmp_path, identity)
