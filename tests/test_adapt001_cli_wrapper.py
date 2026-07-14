@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -102,6 +103,7 @@ def _run_cli(
     args: List[str],
     env: Optional[Dict[str, str]] = None,
     executable: Optional[str] = None,
+    operation_id: Optional[str] = None,
 ):
     profile_dir = setup_profile_env(tmp_path, identity)
     db_path = tmp_path / "outbox.db"
@@ -123,6 +125,12 @@ def _run_cli(
     if env:
         full_env.update(env)
 
+    command_args = list(args)
+    if "remember" in command_args and "--operation-id" not in command_args:
+        command_args.extend(
+            ["--operation-id", operation_id or f"test-{uuid.uuid4().hex}"]
+        )
+
     try:
         res = subprocess.run(
             [
@@ -133,7 +141,7 @@ def _run_cli(
                 "--presence",
                 "hermes",
             ]
-            + args,
+            + command_args,
             capture_output=True,
             text=True,
             env=full_env,
@@ -542,8 +550,20 @@ def test_two_intentional_identical_remembers_create_distinct_memories(
         {"object_id": "obj_second", "namespace": namespace, "content": "same"},
     ]
 
-    first = _run_cli(mock_server, tmp_path, identity, ["--json", "remember", "same"])
-    second = _run_cli(mock_server, tmp_path, identity, ["--json", "remember", "same"])
+    first = _run_cli(
+        mock_server,
+        tmp_path,
+        identity,
+        ["--json", "remember", "same"],
+        operation_id="intent-first",
+    )
+    second = _run_cli(
+        mock_server,
+        tmp_path,
+        identity,
+        ["--json", "remember", "same"],
+        operation_id="intent-second",
+    )
 
     assert first.returncode == second.returncode == 0
     assert json.loads(first.stdout)["object_id"] == "obj_first"
@@ -565,6 +585,37 @@ def test_two_intentional_identical_remembers_create_distinct_memories(
     ]
     assert rows[0][2] != rows[1][2]
     _assert_no_token_leak(second, mock_server, tmp_path, identity)
+
+
+@pytest.mark.parametrize("identity", ["nyla", "sumi"])
+def test_operation_id_reuse_with_different_content_fails_closed(
+    mock_server, tmp_path, identity: str
+) -> None:
+    namespace = f"{identity}/hermes/episodic"
+    mock_server.mock.responses = [
+        {"object_id": "obj_first"},
+        {"object_id": "obj_first", "namespace": namespace, "content": "first"},
+    ]
+    first = _run_cli(
+        mock_server,
+        tmp_path,
+        identity,
+        ["remember", "first"],
+        operation_id="same-operation",
+    )
+    second = _run_cli(
+        mock_server,
+        tmp_path,
+        identity,
+        ["remember", "different"],
+        operation_id="same-operation",
+    )
+
+    assert first.returncode == 0
+    assert second.returncode == 2
+    assert "operation identity was reused" in second.stderr
+    assert sum(request["method"] == "POST" for request in mock_server.mock.requests) == 1
+    assert sum(request["method"] == "GET" for request in mock_server.mock.requests) == 1
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
@@ -1089,6 +1140,7 @@ def _assert_production_crash_recovery(
     expected_episodic_posts: int,
     expected_gets: int,
 ) -> None:
+    operation_id = f"crash-{identity}-{checkpoint}"
     post = {"object_id": "obj_123"}
     get = {
         "object_id": "obj_123",
@@ -1124,10 +1176,17 @@ def _assert_production_crash_recovery(
         identity,
         ["remember", "test"],
         env={"ADAPT_CRASH_AT": checkpoint},
+        operation_id=operation_id,
     )
     assert crashed.returncode == 91
 
-    recovered = _run_cli(mock_server, tmp_path, identity, ["remember", "test"])
+    recovered = _run_cli(
+        mock_server,
+        tmp_path,
+        identity,
+        ["remember", "test"],
+        operation_id=operation_id,
+    )
     assert recovered.returncode == 0
     assert recovered.stdout.strip() == "remembered ✓  (id obj_123)"
     assert (
@@ -1210,6 +1269,7 @@ def test_crash_target_after_verify(mock_server, tmp_path, identity: str) -> None
 def test_recovery_refuses_degraded_receipt_lookup_before_repost(
     mock_server, tmp_path, identity: str
 ) -> None:
+    operation_id = f"degraded-receipt-{identity}"
     mock_server.mock.responses = [{"object_id": "obj_123"}]
     crashed = _run_cli(
         mock_server,
@@ -1217,6 +1277,7 @@ def test_recovery_refuses_degraded_receipt_lookup_before_repost(
         identity,
         ["remember", "test"],
         env={"ADAPT_CRASH_AT": "after_post_before_accept"},
+        operation_id=operation_id,
     )
     assert crashed.returncode == 91
 
@@ -1228,7 +1289,13 @@ def test_recovery_refuses_degraded_receipt_lookup_before_repost(
             "results": [],
         }
     ]
-    recovered = _run_cli(mock_server, tmp_path, identity, ["remember", "test"])
+    recovered = _run_cli(
+        mock_server,
+        tmp_path,
+        identity,
+        ["remember", "test"],
+        operation_id=operation_id,
+    )
     assert recovered.returncode == 2
     assert sum(r["path"] == "/v1/episodic" for r in mock_server.mock.requests) == 1
     assert sum(r["path"] == "/v1/retrieve" for r in mock_server.mock.requests) == 1
