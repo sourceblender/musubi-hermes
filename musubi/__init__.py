@@ -523,6 +523,25 @@ class Outbox:
                 "SELECT * FROM outbox WHERE idem_key=?", (idempotency_key,)
             ).fetchone()
 
+    def row_for_unverified_payload(
+        self, namespace: str, content: str
+    ) -> Optional[sqlite3.Row]:
+        """Return the oldest unresolved exact-payload row for crash recovery.
+
+        A completed intentional repeat is a new capture intent and therefore gets a
+        fresh idempotency key.  Only an exact payload that is still pending, inflight,
+        or accepted may reuse its already-persisted key after process death.
+        """
+        content_sha = hashlib.sha256(content.encode()).hexdigest()
+        with self._lock, self._connect() as con:
+            con.row_factory = sqlite3.Row
+            return con.execute(
+                "SELECT * FROM outbox WHERE namespace=? AND content_sha=? "
+                "AND content=? AND state IN ('pending','inflight','accepted') "
+                "ORDER BY id LIMIT 1",
+                (namespace, content_sha, content),
+            ).fetchone()
+
     def claim_batch(self, limit: int = 20) -> List[sqlite3.Row]:
         """ATOMICALLY lease rows. Two drains can no longer take the same row.
 

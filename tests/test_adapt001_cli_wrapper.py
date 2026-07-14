@@ -531,6 +531,43 @@ def test_remember_success_json(mock_server, tmp_path, identity: str) -> None:
 
 
 @pytest.mark.parametrize("identity", ["nyla", "sumi"])
+def test_two_intentional_identical_remembers_create_distinct_memories(
+    mock_server, tmp_path, identity: str
+) -> None:
+    namespace = f"{identity}/hermes/episodic"
+    mock_server.mock.responses = [
+        {"object_id": "obj_first"},
+        {"object_id": "obj_first", "namespace": namespace, "content": "same"},
+        {"object_id": "obj_second"},
+        {"object_id": "obj_second", "namespace": namespace, "content": "same"},
+    ]
+
+    first = _run_cli(mock_server, tmp_path, identity, ["--json", "remember", "same"])
+    second = _run_cli(mock_server, tmp_path, identity, ["--json", "remember", "same"])
+
+    assert first.returncode == second.returncode == 0
+    assert json.loads(first.stdout)["object_id"] == "obj_first"
+    assert json.loads(second.stdout)["object_id"] == "obj_second"
+    episodic_posts = [
+        request
+        for request in mock_server.mock.requests
+        if request["method"] == "POST" and request["path"] == "/v1/episodic"
+    ]
+    assert len(episodic_posts) == 2
+    assert len({request["headers"]["Idempotency-Key"] for request in episodic_posts}) == 2
+    with sqlite3.connect(tmp_path / "outbox.db") as con:
+        rows = con.execute(
+            "SELECT state, object_id, idem_key FROM outbox ORDER BY id"
+        ).fetchall()
+    assert [(row[0], row[1]) for row in rows] == [
+        ("verified", "obj_first"),
+        ("verified", "obj_second"),
+    ]
+    assert rows[0][2] != rows[1][2]
+    _assert_no_token_leak(second, mock_server, tmp_path, identity)
+
+
+@pytest.mark.parametrize("identity", ["nyla", "sumi"])
 @pytest.mark.parametrize("mode", ["fast", "deep", "blended"])
 def test_recall_ranked_success_json(
     mock_server, tmp_path, identity: str, mode: str
