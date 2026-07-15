@@ -689,7 +689,7 @@ def test_recent_success_json(mock_server, tmp_path, identity: str) -> None:
 def test_recall_preserves_full_content_without_adapter_truncation(
     mock_server, tmp_path, identity: str
 ) -> None:
-    content = "prefix-" + ("memory-evidence-" * 80) + "-decisive-suffix"
+    content_str = "prefix-" + ("memory-evidence-" * 80) + "-decisive-suffix"
     mock_server.mock.responses = [
         {
             "mode": "deep",
@@ -699,7 +699,9 @@ def test_recall_preserves_full_content_without_adapter_truncation(
                 {
                     "object_id": "mem_long",
                     "score": 0.9,
-                    "content": content,
+                    "content": content_str,
+                    "content_truncated": True,
+                    "content_length": 1500,
                     "namespace": f"{identity}/hermes/episodic",
                     "plane": "episodic",
                     "state": "matured",
@@ -714,14 +716,40 @@ def test_recall_preserves_full_content_without_adapter_truncation(
                             "provenance": 0,
                         }
                     },
+                },
+                {
+                    "object_id": "mem_legacy",
+                    "score": 0.8,
+                    "content": "legacy row without metadata",
+                    "namespace": f"{identity}/hermes/episodic",
+                    "plane": "episodic",
+                    "state": "matured",
+                    "importance": 5,
+                    "score_kind": "ranked_combined",
+                    "extra": {
+                        "score_components": {
+                            "relevance": 0.8,
+                            "recency": 0.1,
+                            "reinforcement": 0,
+                            "importance": 0.5,
+                            "provenance": 0,
+                        }
+                    },
                 }
             ],
         }
     ]
     result = _run_cli(mock_server, tmp_path, identity, ["--json", "recall", "test"])
     assert result.returncode == 0
-    assert json.loads(result.stdout)["memories"][0]["content"] == content
-    assert content.endswith("-decisive-suffix")
+    parsed = json.loads(result.stdout)
+    assert parsed["memories"][0]["content"] == content_str
+    assert parsed["memories"][0]["content_truncated"] is True
+    assert parsed["memories"][0]["content_length"] == 1500
+    assert content_str.endswith("-decisive-suffix")
+
+    assert "content_truncated" not in parsed["memories"][1]
+    assert "content_length" not in parsed["memories"][1]
+
     _assert_no_token_leak(result, mock_server, tmp_path, identity)
 
 

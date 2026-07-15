@@ -1303,20 +1303,26 @@ class MusubiMemoryProvider(MemoryProvider):
             being STRIPPED).
           - extra.score_components: dict (ranked: 5 keys; recent:
             exact {}; was being STRIPPED).
-          - content: the snippet (DQ-001: the 300/400 content
-            truncation is FLAGGED SEPARATELY; this commit does NOT
-            silently cement the truncation).
+          - content: the exact snippet returned by Musubi.
+          - content_truncated: boolean indicating truncation (if provided).
+          - content_length: integer of original text length (if provided).
 
         The plugin does NOT fabricate values: missing legacy payload
-        fields render as null, NOT as defaults. DQ-001 (the 300/400
-        content truncation) is still open and a follow-up slice
-        will resolve it.
+        fields render as null, NOT as defaults. Musubi owns the snippet
+        and truncation policy; the adapter passes the returned content and
+        optional `content_truncated`/`content_length` through without an
+        independent cap or fabrication.
         """
+        content = item.get("content") or ""
         out: dict = {
             "object_id": item.get("object_id") or item.get("id"),
             "score": round(float(item.get("score", 0)), 4),
-            "content": (item.get("content") or "").strip()[:400],  # DQ-001
+            "content": content,
         }
+        if "content_truncated" in item:
+            out["content_truncated"] = item["content_truncated"]
+        if "content_length" in item:
+            out["content_length"] = item["content_length"]
         for wire_field in (
             "plane",
             "namespace",
