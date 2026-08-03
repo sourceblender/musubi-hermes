@@ -228,10 +228,27 @@ class MusubiClient:
             "namespace": namespace, "mode": "recent", "limit": 50,
             "tags": [f"{RECEIPT_TAG}{idempotency_key}"],
         })
-        for item in (payload.get("results") or payload.get("data") or []):
-            oid = item.get("object_id") or item.get("id")
-            if oid:
-                return oid
+        if (
+            not isinstance(payload, dict)
+            or payload.get("mode") != "recent"
+            or payload.get("limit") != 50
+            or payload.get("warnings") != []
+            or not isinstance(payload.get("results"), list)
+        ):
+            raise MusubiError(
+                "receipt lookup returned an invalid or degraded envelope",
+                retryable=True,
+            )
+        for item in payload["results"]:
+            if not isinstance(item, dict):
+                raise MusubiError("receipt lookup returned an invalid row", retryable=True)
+            oid = item.get("object_id")
+            if not isinstance(oid, str) or not oid:
+                raise MusubiError(
+                    "receipt lookup returned a row without a canonical object_id",
+                    retryable=True,
+                )
+            return oid
         return None      # authoritative: the server answered, and it does not have it
 
     def write(self, namespace: str, content: str, tags: List[str], importance: int,
@@ -255,9 +272,8 @@ class MusubiClient:
         # SUCCESSFUL write as dead — memories landing in the plane while the agent
         # reported failure. Caught only because the red-proof required a verified
         # write, not a 200. Accept the aliases, but never invent an id.
-        obj_id = (payload.get("object_id") or payload.get("id")
-                  or (payload.get("object") or {}).get("id"))
-        if not obj_id:
+        obj_id = payload.get("object_id")
+        if not isinstance(obj_id, str) or not obj_id:
             raise MusubiError(f"write returned no object_id: {str(payload)[:200]}",
                               retryable=False)
         return obj_id
@@ -271,14 +287,26 @@ class MusubiClient:
         )
 
     def retrieve(self, namespace: str, *, mode: str = "recent", limit: int = 5,
-                 query_text: Optional[str] = None) -> dict:
+                 query_text: Optional[str] = None,
+                 planes: Optional[List[str]] = None,
+                 state_filter: Optional[List[str]] = None) -> dict:
         body: Dict[str, Any] = {"namespace": namespace, "mode": mode, "limit": limit}
         if query_text:
             body["query_text"] = query_text
-        if mode != "recent":
+        if planes is not None:
+            body["planes"] = planes
+        if state_filter is not None:
+            body["state_filter"] = state_filter
+        elif mode != "recent":
             # Ranked modes hide `provisional` unless you ask. Our writes ARE provisional.
             body["state_filter"] = RECALL_STATES
         return self._request("POST", "/retrieve", body=body)
+
+
+def _durability_checkpoint(point: str) -> None:
+    """Private crash-test seam; production is a no-op unless explicitly armed."""
+    if os.environ.get("ADAPT_CRASH_AT") == point:
+        os._exit(91)
 
 
 class Outbox:
@@ -385,7 +413,8 @@ class Outbox:
                 # an orphan that was already ACCEPTED must not be re-POSTed
                 con.execute(
                     f"UPDATE outbox SET state=CASE WHEN object_id IS NOT NULL THEN 'accepted' "
-                    f"ELSE 'pending' END, leased_at=NULL, lease_owner=NULL "
+                    f"ELSE 'pending' END, attempts=attempts+1, "
+                    f"leased_at=NULL, lease_owner=NULL "
                     f"WHERE id IN ({qs})", dead)
             return len(dead)
 
@@ -467,14 +496,15 @@ class Outbox:
             con.close()
 
     def enqueue(self, namespace: str, content: str, tags: List[str],
-                importance: int, session_id: str) -> int:
+                importance: int, session_id: str,
+                idempotency_key: Optional[str] = None) -> int:
         """Durably accept a write. If THIS fails, the write has failed — say so.
 
         The idempotency key is minted HERE and persisted BEFORE we return, so it
         survives process death: a crash between POST and verify replays with the SAME
         key and Musubi de-duplicates instead of creating a second memory.
         """
-        idem = f"hermes-{uuid.uuid4().hex}"
+        idem = idempotency_key or f"hermes-{uuid.uuid4().hex}"
         sha = hashlib.sha256(content.encode()).hexdigest()
         with self._lock, self._connect() as con:
             cur = con.execute(
@@ -484,6 +514,14 @@ class Outbox:
                  time.time(), 0.0),
             )
             return int(cur.lastrowid)
+
+    def row_for_idempotency(self, idempotency_key: str) -> Optional[sqlite3.Row]:
+        """Return the durable row for a stable caller retry key, if present."""
+        with self._lock, self._connect() as con:
+            con.row_factory = sqlite3.Row
+            return con.execute(
+                "SELECT * FROM outbox WHERE idem_key=?", (idempotency_key,)
+            ).fetchone()
 
     def claim_batch(self, limit: int = 20) -> List[sqlite3.Row]:
         """ATOMICALLY lease rows. Two drains can no longer take the same row.
@@ -1057,6 +1095,7 @@ class MusubiMemoryProvider(MemoryProvider):
 
     def _deliver(self, row: sqlite3.Row) -> None:
         assert self._client and self._outbox
+        _durability_checkpoint("after_claim_before_post")
         # ALREADY ACCEPTED? Then Musubi has it. Verify only. NEVER POST AGAIN — the
         # idempotency key expires after 24h and a re-POST past that window creates a
         # SECOND memory. (Yua, long-term audit.)
@@ -1101,9 +1140,11 @@ class MusubiMemoryProvider(MemoryProvider):
                 "DEAD" if not e.retryable else "deferred", row["namespace"], e)
             return
 
+        _durability_checkpoint("after_post_before_accept")
         # PERSIST ACCEPTANCE FIRST. If we crash between here and the readback, the next
         # start sees `accepted` + an object_id and verifies with a GET — it does not POST.
         self._outbox.mark_accepted(row["id"], object_id)
+        _durability_checkpoint("after_accept_before_get")
         self._verify(row, object_id)
 
     def _verify(self, row: sqlite3.Row, object_id: str) -> None:
@@ -1128,6 +1169,7 @@ class MusubiMemoryProvider(MemoryProvider):
                          object_id, e)
             return
 
+        _durability_checkpoint("after_get_before_verify")
         got_id = got.get("object_id") or got.get("id")
         got_ns = got.get("namespace")
         got_sha = hashlib.sha256((got.get("content") or "").encode()).hexdigest()
@@ -1148,6 +1190,7 @@ class MusubiMemoryProvider(MemoryProvider):
             return
 
         self._outbox.mark_verified(row["id"], object_id)
+        _durability_checkpoint("after_verify")
         self._emit_metric("musubi_memory_writes_total", 1, status="success")
         logger.debug("musubi: verified %s -> %s (id+ns+content match)", row["namespace"], object_id)
 
@@ -1260,20 +1303,26 @@ class MusubiMemoryProvider(MemoryProvider):
             being STRIPPED).
           - extra.score_components: dict (ranked: 5 keys; recent:
             exact {}; was being STRIPPED).
-          - content: the snippet (DQ-001: the 300/400 content
-            truncation is FLAGGED SEPARATELY; this commit does NOT
-            silently cement the truncation).
+          - content: the exact snippet returned by Musubi.
+          - content_truncated: boolean indicating truncation (if provided).
+          - content_length: integer of original text length (if provided).
 
         The plugin does NOT fabricate values: missing legacy payload
-        fields render as null, NOT as defaults. DQ-001 (the 300/400
-        content truncation) is still open and a follow-up slice
-        will resolve it.
+        fields render as null, NOT as defaults. Musubi owns the snippet
+        and truncation policy; the adapter passes the returned content and
+        optional `content_truncated`/`content_length` through without an
+        independent cap or fabrication.
         """
+        content = item.get("content") or ""
         out: dict = {
             "object_id": item.get("object_id") or item.get("id"),
             "score": round(float(item.get("score", 0)), 4),
-            "content": (item.get("content") or "").strip()[:400],  # DQ-001
+            "content": content,
         }
+        if "content_truncated" in item:
+            out["content_truncated"] = item["content_truncated"]
+        if "content_length" in item:
+            out["content_length"] = item["content_length"]
         for wire_field in (
             "plane",
             "namespace",

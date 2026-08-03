@@ -232,47 +232,11 @@ class TestRecentPassThrough(unittest.TestCase):
             assert m["extra"]["score_components"] == {}
 
 
-class TestPluginDQF001Flagged(unittest.TestCase):
-    """DQ-001 (the 300/400 content truncation) is FLAGGED via a strict xfail.
+class TestDQ001TruncationParity(unittest.TestCase):
+    """DQ-001: The adapter natively propagates exact string segments and truncation metadata."""
 
-    Per Yua 2026-07-13 12:59:30 BLOCKER B: the prior test was a
-    normal passing assert that literally cemented the 300/400
-    content truncation. The new shape is:
-
-      - This class is marked with ``@unittest.expectedFailure``
-        (Python's equivalent of pytest's strict xfail). The test
-        SHOULD FAIL today (because the plugin currently truncates
-        content to 400 chars).
-      - The test asserts the DESIRED INVARIANT: load-bearing content
-        is NOT silently truncated (a 500-char content is preserved
-        as 500 chars).
-      - When the test fails today, ``@unittest.expectedFailure``
-        records it as EXPECTED FAILURE (xfail). The test does NOT
-        pass green.
-      - When DQ-001 is resolved (the plugin stops truncating), the
-        assertion will PASS. ``@unittest.expectedFailure`` then
-        records it as UNEXPECTED PASS (xpfail strict), which is a
-        test FAILURE -- a loud signal to consciously retire this
-        test in the same slice that fixes the bug.
-      - The test does NOT assert 400 as green; that was the bug
-        cemented by the prior shape.
-
-    A future slice that resolves DQ-001 MUST remove this test in
-    the SAME commit (not silently let it xpasse). The replacement
-    invariant is the absence of the truncation, not its presence.
-    """
-
-    @unittest.expectedFailure
-    def test_dq_001_load_bearing_content_not_silently_truncated(self) -> None:
-        """Load-bearing content is NOT silently truncated (DQ-001 desired invariant).
-
-        Today the plugin truncates content to 400 chars (the
-        historical limit). When the assertion FAILS, the test is
-        marked xfail (expected failure). When the truncation is
-        REMOVED, the assertion will PASS, which (with
-        ``@unittest.expectedFailure``) is an unexpected pass and
-        fails the test -- the loud signal to retire it.
-        """
+    def test_long_content_is_not_silently_truncated(self) -> None:
+        """Load-bearing content is passed completely unaltered."""
         p = _make_provider_with_fake_server(_fake_ranked_payload())
         long_content = "x" * 500
         payload = _fake_ranked_payload()
@@ -280,17 +244,53 @@ class TestPluginDQF001Flagged(unittest.TestCase):
         p._client.retrieve = MagicMock(return_value=payload)
         out = p._tool("musubi_recall", {"query": "x", "limit": 5})
         actual = out["memories"][0]["content"]
-        # DESIRED INVARIANT: a 500-char input is preserved as 500
-        # chars (NOT silently truncated to 400). The test fails
-        # today (the plugin truncates); when the bug is fixed, the
-        # test passes -- which is an unexpected pass with
-        # @unittest.expectedFailure and signals the test must be
-        # retired.
-        assert actual == long_content, (
-            f"DQ-001 OPEN: load-bearing content is silently truncated. "
-            f"Input 500 chars; got {len(actual)}. Fix DQ-001 and retire "
-            f"this test in the same commit."
-        )
+        assert actual == long_content
+
+    def test_truncation_metadata_propagated(self) -> None:
+        """Explicit truncation booleans and content length metadata pass through unmodified."""
+        p = _make_provider_with_fake_server(_fake_ranked_payload())
+        payload = _fake_ranked_payload()
+        payload["results"][0]["content_truncated"] = True
+        payload["results"][0]["content_length"] = 1500
+        p._client.retrieve = MagicMock(return_value=payload)
+        out = p._tool("musubi_recall", {"query": "x", "limit": 5})
+
+        m = out["memories"][0]
+        assert m.get("content_truncated") is True
+        assert m.get("content_length") == 1500
+
+    def test_truncation_metadata_omitted_gracefully_for_legacy_payloads(self) -> None:
+        """If legacy payloads omit the boolean/length fields, the adapter must not fabricate them."""
+        p = _make_provider_with_fake_server(_fake_ranked_payload())
+        payload = _fake_ranked_payload()
+        # Ensure they are truly missing
+        if "content_truncated" in payload["results"][0]:
+            del payload["results"][0]["content_truncated"]
+        if "content_length" in payload["results"][0]:
+            del payload["results"][0]["content_length"]
+
+        p._client.retrieve = MagicMock(return_value=payload)
+        out = p._tool("musubi_recall", {"query": "x", "limit": 5})
+
+        m = out["memories"][0]
+        assert "content_truncated" not in m
+        assert "content_length" not in m
+
+    def test_truncation_metadata_falsy_values_preserved(self) -> None:
+        """Falsy explicit metadata (False, 0) must be preserved exactly, not dropped due to truthiness."""
+        p = _make_provider_with_fake_server(_fake_ranked_payload())
+        payload = _fake_ranked_payload()
+        payload["results"][0]["content_truncated"] = False
+        payload["results"][0]["content_length"] = 0
+        p._client.retrieve = MagicMock(return_value=payload)
+
+        out = p._tool("musubi_recall", {"query": "x", "limit": 5})
+        m = out["memories"][0]
+
+        assert "content_truncated" in m
+        assert m["content_truncated"] is False
+        assert "content_length" in m
+        assert m["content_length"] == 0
 
 
 if __name__ == "__main__":
