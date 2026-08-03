@@ -115,6 +115,72 @@ RECEIPT_TAG = "hermes:idem-"
 # The API docs say this outright. She read them. I did not.
 RECALL_STATES = ["provisional", "matured", "promoted"]
 
+# ---- RET-007 degradation warnings (Musubi #417 / ADAPT-001) ----------------
+#
+# Retrieval can DEGRADE without failing: a plane leg times out, the reranker falls
+# over, the sparse channel dies and it silently falls back to dense-only. The server
+# says so in an additive `warnings` array of bounded codes. The provider used to drop
+# that array on the floor in BOTH musubi_recall envelopes, so partial degradation was
+# invisible to the agent: thin results read exactly like "she has no memory of that."
+# The receipt path already refuses a degraded envelope (`warnings != []` above) — only
+# the recall tool was blind.
+#
+# The vocabulary is Musubi's, mirrored from src/musubi/retrieve/warnings.py. We
+# re-derive rather than import because this plugin ships standalone onto a Hermes host
+# with no Musubi source on it.
+_WARNING_PLANES = frozenset({"episodic", "curated", "concept", "artifact", "thought"})
+_WARNING_SIMPLE_CODES = frozenset({"sparse_embedding_failed", "reranker_failed"})
+_WARNING_PLANE_PREFIXES = ("plane_timeout_", "plane_error_")
+# A bound, not a guess: 2 simple codes + 2 prefixes x 5 planes = 12 distinct codes are
+# possible. Anything past that is a malformed or hostile envelope, not degradation.
+_WARNINGS_MAX = 12
+
+
+def _normalize_warnings(raw: Any) -> tuple[List[str], int]:
+    """Return (allowlisted, deduped, bounded codes, count_dropped).
+
+    Fail-closed by construction: an unrecognised code is DROPPED rather than passed
+    through, because these codes land in a model's context and an unbounded server
+    string there is an injection surface. But dropping silently is the very disease
+    this fix exists to cure, so the count of what was dropped is returned and
+    surfaced — "I discarded 3 things I could not read" is information; discarding
+    them quietly is not.
+
+    Dedup is NOT redundant with the server's. Musubi dedupes structured warnings by
+    (code, plane) and THEN flattens to `.code` alone, so `sparse_embedding_failed` on
+    two different planes arrives as that same string twice. Deduping here is what
+    makes the wire array match what it claims to be.
+    """
+    if not isinstance(raw, list):
+        # Absent is normal (no degradation). A non-list is a malformed envelope:
+        # report nothing, but count it so it is not silently equivalent to healthy.
+        return [], 0 if raw is None else 1
+    seen: set = set()
+    out: List[str] = []
+    dropped = 0
+    for code in raw:
+        if not isinstance(code, str) or not _warning_allowlisted(code):
+            dropped += 1
+            continue
+        if code in seen:
+            continue
+        seen.add(code)
+        if len(out) >= _WARNINGS_MAX:
+            dropped += 1
+            continue
+        out.append(code)
+    return out, dropped
+
+
+def _warning_allowlisted(code: str) -> bool:
+    """True iff `code` is one of Musubi's bounded RET-007 codes."""
+    if code in _WARNING_SIMPLE_CODES:
+        return True
+    for prefix in _WARNING_PLANE_PREFIXES:
+        if code.startswith(prefix):
+            return code[len(prefix):] in _WARNING_PLANES
+    return False
+
 # An unrelated nonce query came back with five results scoring ~0.52-0.56 — indistinguishable
 # from a real hit. The provider discarded the scores and injected all five as "Relevant
 # memories". That is not recall, it is CONFABULATION: handing a friend five strangers and
@@ -1375,6 +1441,14 @@ class MusubiMemoryProvider(MemoryProvider):
             except MusubiError as e:
                 return {"ok": False, "status": "recall_failed", "detail": str(e)}
             items = payload.get("results") or payload.get("data") or []
+            # RET-007: carry degradation into BOTH envelopes. An empty result set during
+            # a plane timeout is NOT the same fact as an empty result set from a healthy
+            # index, and the no-relevant branch is exactly where that difference decides
+            # whether "I don't remember" is honest.
+            warnings, warnings_dropped = _normalize_warnings(payload.get("warnings"))
+            degraded: Dict[str, Any] = {"warnings": warnings}
+            if warnings_dropped:
+                degraded["warnings_dropped"] = warnings_dropped
             kept = [i for i in items if _passes_floor(i.get("score"))]
             if not kept:
                 # Saying "I do not remember" is a VALID and honest answer. Handing back
@@ -1382,13 +1456,14 @@ class MusubiMemoryProvider(MemoryProvider):
                 return {"ok": True, "status": "no_relevant_memories",
                         "detail": f"{len(items)} candidate(s) all scored below the "
                                   f"relevance floor ({RECALL_MIN_SCORE})",
-                        "memories": []}
+                        "memories": [], **degraded}
             # object_id + score, not content-only — Yua: recall results must be auditable.
             # If a memory turns up in her context, we must be able to say WHICH one and
             # HOW confident, or nobody can ever check whether recall is lying.
             return {"ok": True, "status": "ok", "mode": RECALL_MODE,
                     "floor": RECALL_MIN_SCORE,
-                    "memories": [self._transform_musubi_row(i) for i in kept]}
+                    "memories": [self._transform_musubi_row(i) for i in kept],
+                    **degraded}
 
         return {"ok": False, "status": "unknown_tool", "detail": tool_name}
 
