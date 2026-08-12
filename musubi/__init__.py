@@ -107,6 +107,17 @@ VALID_PLANES = ("episodic", "curated", "concept", "artifact", "thought", "lifecy
 # 'fast', 'deep', 'blended' or 'recent'). Query-driven recall is `blended`.
 MODE_QUERY = "blended"   # recall is pinned to this mode; the floor below is calibrated for it
 MODE_RECENT = "recent"
+# RET-015: `blended` can exhaust the server's whole-call deadline under concurrent load
+# and return 503 BACKEND_UNAVAILABLE. The server repair (Musubi v1.23.6) removed the
+# cliff at ten callers; this is the client's defence in depth for whatever the next
+# ceiling turns out to be (musubi#681).
+#
+# The contract is deliberately ONE attempt each, and the asymmetry matters:
+#   blended 503  ->  exactly one `fast` attempt  ->  never a second blended request.
+# Retrying blended would add another blocking call to the path that is already starving,
+# i.e. the client would help cause the outage it is reacting to. Degraded recall beats
+# no recall; a retry storm beats nothing.
+MODE_FALLBACK = "fast"
 
 # `kind:` is a RESERVED semantic vocabulary (musubi retrieve/context_pack.py:32 VALID_KINDS).
 # It describes what a memory MEANS, not where it came from. A conversation turn is an
@@ -1456,12 +1467,13 @@ class MusubiMemoryProvider(MemoryProvider):
         if tool_name == "musubi_recall":
             if not self._client:
                 return {"ok": False, "status": "unavailable"}
+            limit = max(1, min(int(args.get("limit", 5)), RECALL_MAX_LIMIT))
             try:
-                payload = self._client.retrieve(
-                    self._namespace("episodic"), mode=MODE_QUERY,
+                payload, recall_mode, fell_back = self._retrieve_with_fallback(
+                    self._namespace("episodic"),
                     # CLAMPED at runtime too — a schema maximum is a suggestion to a model,
                     # not a guarantee to a server. (Yua)
-                    limit=max(1, min(int(args.get("limit", 5)), RECALL_MAX_LIMIT)),
+                    limit=limit,
                     query_text=args["query"],
                 )
             except MusubiError as e:
@@ -1475,6 +1487,14 @@ class MusubiMemoryProvider(MemoryProvider):
             degraded: Dict[str, Any] = {"warnings": warnings}
             if warnings_dropped:
                 degraded["warnings_dropped"] = warnings_dropped
+            if fell_back:
+                # The caller is reading memories ranked by a WEAKER method than the floor
+                # was calibrated against. Saying so is the whole point — a silent downgrade
+                # is indistinguishable from healthy recall, which is how quality collapses
+                # without anyone noticing (RET-015).
+                degraded["recall_degraded"] = (
+                    f"{MODE_QUERY} unavailable (503); served from {MODE_FALLBACK}"
+                )
             kept = [i for i in items if _passes_floor(i.get("score"))]
             if not kept:
                 # Saying "I do not remember" is a VALID and honest answer. Handing back
@@ -1486,12 +1506,41 @@ class MusubiMemoryProvider(MemoryProvider):
             # object_id + score, not content-only — Yua: recall results must be auditable.
             # If a memory turns up in her context, we must be able to say WHICH one and
             # HOW confident, or nobody can ever check whether recall is lying.
-            return {"ok": True, "status": "ok", "mode": RECALL_MODE,
+            return {"ok": True, "status": "ok", "mode": recall_mode,
                     "floor": RECALL_MIN_SCORE,
                     "memories": [self._transform_musubi_row(i) for i in kept],
                     **degraded}
 
         return {"ok": False, "status": "unknown_tool", "detail": tool_name}
+
+    def _retrieve_with_fallback(
+        self, namespace: str, *, limit: int, query_text: str
+    ) -> tuple[dict, str, bool]:
+        """Recall once on `blended`; on a 503, recall once on `fast`. Never retry blended.
+
+        Returns `(payload, mode_that_served, fell_back)`.
+
+        RET-015. Only a 503 triggers the fallback — every other failure is raised, because
+        a 401 is not a capacity problem and re-asking in a cheaper mode would just hide it.
+        A `fast` failure is raised too: two dead modes is an outage, not something to paper
+        over with an empty result set that reads as "I don't remember."
+        """
+        try:
+            payload = self._client.retrieve(
+                namespace, mode=MODE_QUERY, limit=limit, query_text=query_text
+            )
+            return payload, MODE_QUERY, False
+        except MusubiError as e:
+            if e.status != 503:
+                raise
+            logger.warning(
+                "Blended recall unavailable (HTTP 503); falling back to %s once. namespace=%s",
+                MODE_FALLBACK, namespace,
+            )
+        payload = self._client.retrieve(
+            namespace, mode=MODE_FALLBACK, limit=limit, query_text=query_text
+        )
+        return payload, MODE_FALLBACK, True
 
     def _row_state(self, row_id: int) -> str:
         assert self._outbox
