@@ -56,6 +56,26 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+_DISCORD_TRIGGER_RE = re.compile(
+    r"\[Triggering message id:\s*`?\d+`?\s+—\s+use as\s+`?message_id`?\s+"
+    r"for reply/react/pin via the discord tools\.\]\s*",
+    re.IGNORECASE,
+)
+_MEDIA_PATH_RE = re.compile(r"MEDIA:(/\S+)")
+
+
+def _scrub_user_capture(content: Any) -> str:
+    """Remove command-chair routing syntax before a turn becomes memory."""
+    return _DISCORD_TRIGGER_RE.sub("", str(content)).strip()
+
+
+def _scrub_assistant_capture(content: Any) -> str:
+    """Describe attached pictures without persisting host-local paths."""
+    return _MEDIA_PATH_RE.sub(
+        lambda match: f"[sent a picture: {Path(match.group(1)).name}]",
+        str(content),
+    ).strip()
+
 
 def _passes_floor(score: Any) -> bool:
     """A result is kept ONLY if it carries a numeric score at or above the floor.
@@ -1030,9 +1050,15 @@ class MusubiMemoryProvider(MemoryProvider):
             return
         parts = []
         if user_content:
-            parts.append(f"USER: {str(user_content).strip()}")
+            clean_user = _scrub_user_capture(user_content)
+            if clean_user:
+                parts.append(f"USER: {clean_user}")
         if assistant_content:
-            parts.append(f"ASSISTANT: {str(assistant_content).strip()}")
+            clean_assistant = _scrub_assistant_capture(assistant_content)
+            if clean_assistant:
+                parts.append(f"ASSISTANT: {clean_assistant}")
+        if not parts:
+            return
         sid = session_id or self._session_id
         # PROPAGATE. Yua, P0: "a log line is not propagation." Hermes owns turning a
         # provider exception into a warning; a provider that eats its own durability
