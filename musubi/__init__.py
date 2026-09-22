@@ -630,9 +630,13 @@ class Outbox:
         now = time.time()
         with self._lock, self._connect() as con:
             con.row_factory = sqlite3.Row
-            # reclaim leases abandoned by a dead process
+            # TTL is the backstop for a wedged owner, live or dead. A reclaim that
+            # leaves attempts at 0 is delivered as a first POST, and _deliver only
+            # receipt-lookups when attempts > 0. An object_id means Musubi already
+            # accepted the write: return to accepted so the retry is GET-only.
             con.execute(
-                "UPDATE outbox SET state='pending', leased_at=NULL, lease_owner=NULL "
+                "UPDATE outbox SET state=CASE WHEN object_id IS NOT NULL THEN 'accepted' "
+                "ELSE 'pending' END, attempts=attempts+1, leased_at=NULL, lease_owner=NULL "
                 "WHERE state='inflight' AND leased_at IS NOT NULL AND leased_at < ?",
                 (now - self.LEASE_TTL,),
             )
