@@ -17,6 +17,8 @@ package = false
 testpaths = [
   "tests/contract",
   "tests/test_memory_hygiene.py",
+  "tests/test_blended_fallback.py",
+  "tests/test_lease_reclaim.py",
   "tests/test_ret003_pass_through.py",
   "tests/test_ret007_warnings_passthrough.py",
 ]
