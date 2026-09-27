@@ -166,8 +166,12 @@ def _initialize(provider, h: Path, **kw):
 
 def test_storage_follows_the_home_handed_in_not_process_env(home, monkeypatch, no_network):
     h, decoy = home
-    monkeypatch.setenv("HERMES_HOME", str(decoy))
+    # Load while HERMES_HOME is the real profile: discovery legitimately finds user
+    # plugins through the process home. Only initialize() must follow the home it is
+    # handed, so the decoy goes in between the two.
     provider = _load()
+    assert provider is not None
+    monkeypatch.setenv("HERMES_HOME", str(decoy))
     _initialize(provider, h, agent_context="primary")
     try:
         assert (h / "musubi-outbox.db").exists(), "outbox must live under the handed-in hermes_home"
