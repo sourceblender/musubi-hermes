@@ -63,9 +63,13 @@ the provider and readback again before declaring the profile healthy.
 
 The implementation is in `musubi/__init__.py`; the root `__init__.py`,
 `plugin.yaml`, `config_schema.py`, and `cli.py` are Hermes discovery surfaces.
-The source tests under `tests/` are retained from the earlier fleet-tools
-provider. Real-loader contract tests use Hermes Agent's actual plugin discovery
-against a temporary `HERMES_HOME`; live write/readback is a separate deploy gate.
+Run `pytest -q` for the safe local unit suite and `python3
+tests/test_lease_contention.py` for the two-process SQLite lease gate.
+`python3 tests/test_upgrade_and_recovery.py` checks migrations and telemetry
+using temporary data and a dummy credential. Real-loader contract tests use
+Hermes Agent's actual plugin discovery against a temporary `HERMES_HOME`; they
+skip outside a Hermes Python environment. Live write/readback is a separate
+deploy gate and requires a real profile credential.
 
 See the [Hermes memory-provider plugin guide](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/memory-provider-plugin.md)
 for the host interface and installation rules.

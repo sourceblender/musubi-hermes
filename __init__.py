@@ -1,6 +1,9 @@
 """Hermes directory-plugin entry point for Musubi memory."""
 
-from .musubi import MusubiMemoryProvider
+if __package__:
+    from .musubi import MusubiMemoryProvider
+else:  # pytest imports this repository root as a plain module.
+    from musubi import MusubiMemoryProvider
 
 
 def register(ctx) -> None:
