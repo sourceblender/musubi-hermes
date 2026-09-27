@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a change to the Musubi memory provider for Hermes Agent.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `musubi-hermes` is intentionally narrow: one Hermes memory provider for
+        one memory service. Before proposing an addition, please check whether it
+        belongs here (Hermes-specific), in Hermes Agent itself, or in the Musubi
+        server.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+
+  - type: textarea
+    id: contract
+    attributes:
+      label: Contract impact
+      description: Does this change the provider name, the `musubi:` config keys, the data paths, or the tool names? Existing profiles depend on all four.

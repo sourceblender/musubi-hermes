@@ -1,13 +1,31 @@
 # Musubi for Hermes Agent
 
+[![CI](https://github.com/sourceblender/musubi-hermes/actions/workflows/ci.yml/badge.svg)](https://github.com/sourceblender/musubi-hermes/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 This repository is a Hermes directory plugin for durable Musubi memory. It
 registers one memory provider named `musubi`, captures primary-context turns,
 offers the `musubi_*` tools, and keeps pending writes in a profile-local SQLite
 outbox until the stored object is verified by readback.
 
+## What it provides
+
+- **A memory provider** named `musubi`, selected with `memory.provider: musubi`.
+- **Two tools.** `musubi_remember` stores something worth keeping. It returns
+  `queued` at once and `stored` only after the memory has been read back by id.
+  `musubi_recall` searches the profile's memory.
+- **Automatic capture** of completed turns in primary contexts, through a
+  durable outbox that survives restarts and outages. Cron and subagent contexts
+  never write automatically.
+- **Recall guidance** in the system prompt. `musubi.recall_guidance` can
+  replace the recall paragraph for a seat. The memory framing and the
+  write-verification rules always stay.
+- **`hermes musubi status`** for outbox health, without posting a memory.
+
 ## Requirements
 
 - Hermes Agent 0.21.4 or newer, with its Python environment and PyYAML.
+  The contract suite has been run against 0.21.4 and 0.21.5.
 - A Musubi API endpoint and a credential scoped to the configured presence.
 - One plugin installation per Hermes profile that uses Musubi.
 
@@ -76,3 +94,15 @@ deploy gate and requires a real profile credential.
 
 See the [Hermes memory-provider plugin guide](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/memory-provider-plugin.md)
 for the host interface and installation rules.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and the
+contract that existing profiles depend on, and the [changelog](CHANGELOG.md) for
+release history. Please report vulnerabilities privately, as described in
+[SECURITY.md](SECURITY.md). Participation is covered by our
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+## License
+
+[MIT](LICENSE)
