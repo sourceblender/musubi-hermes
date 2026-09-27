@@ -130,6 +130,16 @@ def test_is_available_true_with_scoped_credentials_and_still_offline(home, no_ne
         secret_scope.reset_secret_scope(token)
 
 
+def test_config_url_and_scoped_token_work_without_legacy_env_file(home, no_network):
+    h, _ = home
+    _write_config(h, "  api_url: http://musubi.example.test/v1\n")
+    token = secret_scope.set_secret_scope({"MUSUBI_TOKEN": "t"}, profile_home=str(h))
+    try:
+        assert _load().is_available() is True
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+
 def test_is_available_does_not_raise_under_multiplex_without_a_scope(home, no_network):
     secret_scope.set_multiplex_active(True)
     try:
@@ -237,7 +247,9 @@ def test_recall_guidance_defaults_to_nylas_text_and_is_configurable(home, no_net
     provider = _load()
     _initialize(provider, h, agent_context="primary")
     try:
-        assert NYLA_GUIDANCE_MARK in provider.system_prompt_block()
+        block = provider.system_prompt_block()
+        assert NYLA_GUIDANCE_MARK in block
+        assert "Eric" not in block
     finally:
         provider.shutdown()
 
@@ -248,6 +260,9 @@ def test_recall_guidance_defaults_to_nylas_text_and_is_configurable(home, no_net
         block = provider.system_prompt_block()
         assert "SUMI-SPECIFIC GUIDANCE MARKER" in block
         assert NYLA_GUIDANCE_MARK not in block
+        assert "durable long-term memory" in block
+        assert "musubi_remember" in block
+        assert "queued" in block and "FAILED" in block
     finally:
         provider.shutdown()
 
@@ -255,7 +270,10 @@ def test_recall_guidance_defaults_to_nylas_text_and_is_configurable(home, no_net
 def test_save_config_round_trips_non_secret_fields(home, no_network):
     h, _ = home
     (h / "config.yaml").write_text("memory:\n  provider: musubi\n")
-    _load().save_config({"tenant": "roundtrip", "presence": "hermes", "env_file": "/nonexistent"}, str(h))
+    _load().save_config({"tenant": "roundtrip", "presence": "hermes",
+                         "env_file": "/nonexistent", "api_url": "https://musubi.example.test/v1"}, str(h))
     text = (h / "config.yaml").read_text()
     assert "roundtrip" in text and "musubi:" in text
+    assert "musubi.example.test" in text
+    assert "MUSUBI_TOKEN" not in text
     assert "memory:" in text, "save_config must merge, not overwrite, config.yaml"

@@ -29,15 +29,18 @@ memory:
 musubi:
   tenant: example
   presence: assistant
-  env_file: /path/to/profile-private/musubi.env
-  # Optional: seat-specific system-prompt recall instructions.
+  api_url: https://musubi.example.test/v1
+  # Legacy profile credential file, when used:
+  # env_file: /path/to/profile-private/musubi.env
+  # Optional: seat-specific recall paragraph inside the fixed memory prompt.
   recall_guidance: "Recall decisions and people before answering from memory."
 ```
 
-The credential file is mode 600 and contains `MUSUBI_API_URL` and
-`MUSUBI_TOKEN`. Hermes' profile secret scope also supports those names and takes
-precedence over file values. Never put the token in `config.yaml`. Each profile
-must have its own tenant, presence, credential, and Hermes home.
+The setup wizard stores `MUSUBI_TOKEN` in Hermes' profile-scoped `.env`.
+Existing profiles may instead keep a mode-600 `env_file` containing
+`MUSUBI_API_URL` and `MUSUBI_TOKEN`. Scoped credentials take precedence over
+file values. Never put the token in `config.yaml`. Each profile must have its
+own tenant, presence, credential, and Hermes home.
 
 The provider keeps its existing data paths: `$HERMES_HOME/musubi-outbox.db` and
 `$HERMES_HOME/metrics/musubi.prom`. Installing the plugin does not migrate or

@@ -1,6 +1,7 @@
 """Configuration shown by Hermes' memory provider panel."""
 
 from plugins.memory.config_schema import (
+    KIND_SECRET,
     KIND_TEXT,
     ProviderConfigSchema,
     ProviderField,
@@ -17,6 +18,20 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             label="Profile credential file",
             kind=KIND_TEXT,
             description="Existing mode-600 file containing MUSUBI_API_URL and MUSUBI_TOKEN.",
+            inline=True,
+        ),
+        ProviderField(
+            key="api_url",
+            label="Musubi API URL",
+            kind=KIND_TEXT,
+            env_fallbacks=("MUSUBI_API_URL",),
+            inline=True,
+        ),
+        ProviderField(
+            key="token",
+            label="Musubi token",
+            kind=KIND_SECRET,
+            env_key="MUSUBI_TOKEN",
             inline=True,
         ),
         ProviderField(

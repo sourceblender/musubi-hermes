@@ -843,7 +843,7 @@ class MusubiMemoryProvider(MemoryProvider):
         # Hermes scopes these reads to the active profile. A multiplexed secondary
         # must never inherit the gateway process's default-profile environment.
         env_file = os.path.expanduser(cfg.get("env_file") or get_secret("MUSUBI_ENV", "") or "")
-        api_url = ""
+        api_url = cfg.get("api_url", "")
         token = ""
         if env_file and Path(env_file).exists():
             for line in Path(env_file).read_text().splitlines():
@@ -1554,12 +1554,10 @@ class MusubiMemoryProvider(MemoryProvider):
     # ---- system prompt ------------------------------------------------------
 
     def system_prompt_block(self) -> str:
-        return self._cfg.get("recall_guidance") or (
-            "You have a durable long-term memory (Musubi). It persists across sessions, "
-            "machines, and harnesses.\n"
+        guidance = self._cfg.get("recall_guidance") or (
             "Musubi memories are retrieved on demand. Use the current conversation and "
             "loaded context first. Call musubi_recall when a relevant past fact is missing "
-            "or Eric asks you to remember. A greeting, familiar name, opinion, or ordinary "
+            "or the user asks you to remember. A greeting, familiar name, opinion, or ordinary "
             "conversation does not by itself require recall. Honor requests for no lookup.\n"
             "HOW TO QUERY WELL: use the distinctive nouns of the topic (names, titles, "
             "objects). If a needed fact is missing after the first query, try at most "
@@ -1567,7 +1565,12 @@ class MusubiMemoryProvider(MemoryProvider):
             "READ what comes back: the 'memories' list contains the actual remembered "
             "text — base your answer on what it says, not on whether it felt like a "
             "perfect match. Only when recall truly returns nothing relevant do you say "
-            "you do not remember — never invent.\n"
+            "you do not remember — never invent."
+        )
+        return (
+            "You have a durable long-term memory (Musubi). It persists across sessions, "
+            "machines, and harnesses.\n"
+            f"{guidance.strip()}\n"
             "Use musubi_remember for what is worth keeping — who someone is, what was "
             "decided, what you learned.\n"
             "A write is only real once it is verified. If a tool says 'queued', it is safe "
@@ -1642,38 +1645,28 @@ class MusubiMemoryProvider(MemoryProvider):
             {"key": "presence", "label": "Which seat (e.g. assistant, command-chair)",
              "required": True},
             {"key": "env_file", "label": "Path to the per-presence Musubi env (mode 600)",
-             "required": True},
+             "required": False},
+            {"key": "api_url", "label": "Musubi API URL", "required": True},
+            {"key": "token", "label": "Profile-scoped Musubi token", "required": True,
+             "secret": True, "env_var": "MUSUBI_TOKEN"},
             {"key": "recall_guidance", "label": "Seat-specific recall guidance",
              "required": False},
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
         """Merge setup values into the profile's config without storing credentials."""
-        import yaml  # Hermes ships PyYAML.
+        from hermes_cli.config import save_config
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 
-        allowed = {"tenant", "presence", "env_file", "recall_guidance"}
+        allowed = {"tenant", "presence", "env_file", "api_url", "recall_guidance"}
         unknown = set(values) - allowed
         if unknown:
             raise ValueError(f"unsupported Musubi setting(s): {', '.join(sorted(unknown))}")
-        path = Path(hermes_home) / "config.yaml"
-        data = yaml.safe_load(path.read_text()) if path.exists() else {}
-        if data is None:
-            data = {}
-        if not isinstance(data, dict):
-            raise ValueError("Hermes config.yaml must be a mapping")
-        section = data.get("musubi") or {}
-        if not isinstance(section, dict):
-            raise ValueError("Hermes musubi config must be a mapping")
-        data["musubi"] = {**section, **values}
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".musubi.tmp")
+        profile = set_hermes_home_override(hermes_home)
         try:
-            with tmp.open("w") as stream:
-                os.chmod(tmp, 0o600)
-                yaml.safe_dump(data, stream, sort_keys=False)
-            tmp.replace(path)
+            save_config({"musubi": values}, merge_existing=True)
         finally:
-            tmp.unlink(missing_ok=True)
+            reset_hermes_home_override(profile)
 
     def backup_paths(self) -> List[str]:
         home = self._home or get_hermes_home()
