@@ -1,0 +1,5 @@
+name: musubi
+version: 0.1.0
+description: "Durable Musubi memory for Hermes Agent, with verified writes and profile-scoped recall."
+pip_dependencies: []
+requires_env: []

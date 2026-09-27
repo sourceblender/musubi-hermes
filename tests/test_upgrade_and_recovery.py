@@ -159,7 +159,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from musubi import MusubiMemoryProvider  # noqa: E402
 
 _home = _pl.Path(_tf.mkdtemp())
-_env = _pl.Path.home() / ".musubi/musubi-mcp-aoi.env"
+_env = _home / "musubi.env"
+_env.write_text("MUSUBI_API_URL=http://127.0.0.1:1/v1\nMUSUBI_TOKEN=test-token\n")
 (_home / "config.yaml").write_text(
     f"musubi:\n  tenant: aoi\n  presence: command-chair\n  env_file: {_env}\n")
 _os.environ["HERMES_HOME"] = str(_home)

@@ -1,0 +1,22 @@
+[project]
+name = "musubi-hermes"
+version = "0.1.0"
+description = "Musubi memory provider plugin for Hermes Agent"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/sourceblender/musubi-hermes"
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = [
+  "tests/contract",
+  "tests/test_memory_hygiene.py",
+  "tests/test_ret003_pass_through.py",
+  "tests/test_ret007_warnings_passthrough.py",
+]
