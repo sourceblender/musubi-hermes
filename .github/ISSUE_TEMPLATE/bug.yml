@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a defect in the musubi-hermes Hermes Agent plugin.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. The most useful reports show the Hermes
+        version, the plugin commit, what you did, what you expected, and what
+        came back. Never paste tokens, `.env` contents or memory text.
+
+  - type: input
+    id: plugin-commit
+    attributes:
+      label: Plugin commit or version
+      description: The commit you installed (`git -C "$HERMES_HOME/plugins/musubi" rev-parse HEAD`) or the release tag.
+    validations:
+      required: true
+
+  - type: input
+    id: hermes-version
+    attributes:
+      label: Hermes Agent version
+      description: The output of `hermes --version`.
+    validations:
+      required: true
+
+  - type: textarea
+    id: status
+    attributes:
+      label: Provider status
+      description: The output of `hermes musubi status` and `hermes memory status` for the affected profile.
+      render: text
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproducer
+      description: Steps, config shape (keys only, no values), and log lines. Redact conversation content.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true

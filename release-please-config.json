@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "python",
+      "package-name": "musubi-hermes",
+      "extra-files": [
+        {
+          "type": "yaml",
+          "path": "plugin.yaml",
+          "jsonpath": "$.version"
+        }
+      ],
+      "include-component-in-tag": false
+    }
+  }
+}
