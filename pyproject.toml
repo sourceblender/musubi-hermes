@@ -3,7 +3,7 @@ name = "musubi-hermes"
 version = "0.1.0"
 description = "Musubi memory provider plugin for Hermes Agent"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = []
 

@@ -1,7 +1,7 @@
 # Musubi for Hermes Agent
 
 [![CI](https://github.com/sourceblender/musubi-hermes/actions/workflows/ci.yml/badge.svg)](https://github.com/sourceblender/musubi-hermes/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 This repository is a Hermes directory plugin for durable Musubi memory. It
 registers one memory provider named `musubi`, captures primary-context turns,
@@ -105,4 +105,4 @@ release history. Please report vulnerabilities privately, as described in
 
 ## License
 
-[MIT](LICENSE)
+[Apache-2.0](LICENSE). Earlier MIT-licensed versions retain their original terms; see [LICENSE-MIT-LEGACY](LICENSE-MIT-LEGACY).
