@@ -1,33 +1,11 @@
 """Musubi memory provider for Hermes Agent.
 
-A USER PLUGIN — it lives at ``$HERMES_HOME/plugins/musubi/`` and is discovered
-by Hermes' own plugin loader (``plugins/memory/__init__.py``). **We do not fork
-hermes-agent.** Upstream stays clean; we add.
-
-Why this exists
----------------
-Before this, Nyla and Sumi ran with ``memory_enabled: false``. They had no token,
-no env, no Musubi reference anywhere on their box. Every conversation they ever
-had went straight through them and out. Tama, Shiori, Yua and Aoi did better only
-because a human remembered to push. That is a habit, not an architecture.
-
-This makes persistence automatic instead of virtuous.
-
-The rules this file is built to (spec: harem-ops/projects/active/hermes-musubi-provider)
------------------------------------------------------------------------------------
-1. **A memory system that silently drops writes is worse than none.** It
-   manufactures false confidence. So: a durable on-disk outbox, and a write is
-   only ever reported as *stored* after it has been **read back by id**. The echo
-   is not the evidence.
-2. **Presence is the SEAT, not the harness and not the transport.** Namespace is
-   ``tenant/presence/plane`` and comes from *config*. Which door a message arrived
-   through (``cli``/``discord``/``telegram``) is **metadata on the memory**, never
-   part of who she is.
-3. **Non-primary contexts never write.** Hermes' own ABC warns that cron system
-   prompts corrupt user representations. Cron writing its prompt into Tama's
-   memory is poisoning that looks like normal operation.
-4. **Silence is the failure mode.** Every write emits telemetry so a *stopped*
-   write is visible, not just a failed one.
+The directory plugin is installed at ``$HERMES_HOME/plugins/musubi/`` and
+registered through Hermes' memory provider loader. It uses a local SQLite
+outbox so completed turns survive transient outages, and confirms writes by
+reading the stored object back. The namespace comes from the profile's tenant
+and presence; platform is recorded only as provenance. Background delivery is
+limited to primary agent contexts, with textfile metrics for operator checks.
 """
 
 from __future__ import annotations
@@ -49,10 +27,26 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:  # Hermes provides the ABC. Import defensively so the module is testable alone.
-    from agent.memory_provider import MemoryProvider
+    from agent.memory_provider import MemoryProvider, spawn_context_thread
 except Exception:  # pragma: no cover
     class MemoryProvider:  # type: ignore
         pass
+
+    def spawn_context_thread(target, *, name, daemon=True, args=(), kwargs=None):
+        return threading.Thread(target=target, name=name, daemon=daemon,
+                                args=args, kwargs=kwargs or {})
+
+try:
+    from agent.secret_scope import get_secret
+except ImportError:  # Standalone source tests run without Hermes installed.
+    def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+        return os.environ.get(name, default)
+
+try:
+    from hermes_constants import get_hermes_home
+except ImportError:  # Standalone source tests run without Hermes installed.
+    def get_hermes_home() -> Path:
+        return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
 
 logger = logging.getLogger(__name__)
 
@@ -811,6 +805,7 @@ class MusubiMemoryProvider(MemoryProvider):
         self._worker: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._prune_tick = 0
+        self._home: Optional[Path] = None
 
     def _load_config(self, hermes_home: str) -> Dict[str, Any]:
         """Config + the per-presence env file. NEVER a plaintext token in config.yaml.
@@ -845,17 +840,22 @@ class MusubiMemoryProvider(MemoryProvider):
                     if m:
                         cfg[m.group(1)] = m.group(2).strip().strip('"').strip("'")
 
-        env_file = os.path.expanduser(
-            cfg.get("env_file") or os.environ.get("MUSUBI_ENV", "")
-        )
-        api_url = os.environ.get("MUSUBI_API_URL", "")
-        token = os.environ.get("MUSUBI_TOKEN", "")
+        # Hermes scopes these reads to the active profile. A multiplexed secondary
+        # must never inherit the gateway process's default-profile environment.
+        env_file = os.path.expanduser(cfg.get("env_file") or get_secret("MUSUBI_ENV", "") or "")
+        api_url = ""
+        token = ""
         if env_file and Path(env_file).exists():
             for line in Path(env_file).read_text().splitlines():
                 if line.startswith("MUSUBI_API_URL="):
                     api_url = line.split("=", 1)[1].strip()
                 elif line.startswith("MUSUBI_TOKEN="):
                     token = line.split("=", 1)[1].strip()
+
+        # A bound secret scope takes precedence; the env file remains a supported
+        # delivery path for existing Nyla/Sumi profiles.
+        api_url = get_secret("MUSUBI_API_URL", "") or api_url
+        token = get_secret("MUSUBI_TOKEN", "") or token
 
         cfg["api_url"] = api_url
         cfg["token"] = token
@@ -866,7 +866,7 @@ class MusubiMemoryProvider(MemoryProvider):
 
         A provider that pings on init turns a slow network into a broken agent.
         """
-        home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+        home = str(get_hermes_home())
         try:
             cfg = self._load_config(home)
         except Exception as e:
@@ -892,8 +892,8 @@ class MusubiMemoryProvider(MemoryProvider):
         return True
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        home = kwargs.get("hermes_home") or os.environ.get(
-            "HERMES_HOME", os.path.expanduser("~/.hermes"))
+        home = str(kwargs.get("hermes_home") or get_hermes_home())
+        self._home = Path(home)
         self._cfg = self._load_config(home)
         self._session_id = session_id
 
@@ -962,8 +962,7 @@ class MusubiMemoryProvider(MemoryProvider):
             if self._worker is not None and self._worker.is_alive():
                 logger.debug("musubi: drain worker already running — not starting another")
             else:
-                self._worker = threading.Thread(target=self._drain_loop, name="musubi-outbox",
-                                                daemon=True)
+                self._worker = spawn_context_thread(self._drain_loop, name="musubi-outbox")
                 self._worker.start()
         else:
             # Yua, P1: every context started the worker, so a cron run would happily
@@ -1555,13 +1554,20 @@ class MusubiMemoryProvider(MemoryProvider):
     # ---- system prompt ------------------------------------------------------
 
     def system_prompt_block(self) -> str:
-        return (
+        return self._cfg.get("recall_guidance") or (
             "You have a durable long-term memory (Musubi). It persists across sessions, "
             "machines, and harnesses.\n"
-            "Memories are NOT injected automatically — you must ASK. Call musubi_recall "
-            "BEFORE assuming you do not know something, and whenever the conversation "
-            "touches a person, a decision, or something you were told before. If recall "
-            "returns nothing, say you do not remember rather than inventing.\n"
+            "Musubi memories are retrieved on demand. Use the current conversation and "
+            "loaded context first. Call musubi_recall when a relevant past fact is missing "
+            "or Eric asks you to remember. A greeting, familiar name, opinion, or ordinary "
+            "conversation does not by itself require recall. Honor requests for no lookup.\n"
+            "HOW TO QUERY WELL: use the distinctive nouns of the topic (names, titles, "
+            "objects). If a needed fact is missing after the first query, try at most "
+            "ONE useful rephrasing; otherwise continue the conversation.\n"
+            "READ what comes back: the 'memories' list contains the actual remembered "
+            "text — base your answer on what it says, not on whether it felt like a "
+            "perfect match. Only when recall truly returns nothing relevant do you say "
+            "you do not remember — never invent.\n"
             "Use musubi_remember for what is worth keeping — who someone is, what was "
             "decided, what you learned.\n"
             "A write is only real once it is verified. If a tool says 'queued', it is safe "
@@ -1637,9 +1643,44 @@ class MusubiMemoryProvider(MemoryProvider):
              "required": True},
             {"key": "env_file", "label": "Path to the per-presence Musubi env (mode 600)",
              "required": True},
+            {"key": "recall_guidance", "label": "Seat-specific recall guidance",
+             "required": False},
         ]
 
+    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
+        """Merge setup values into the profile's config without storing credentials."""
+        import yaml  # Hermes ships PyYAML.
+
+        allowed = {"tenant", "presence", "env_file", "recall_guidance"}
+        unknown = set(values) - allowed
+        if unknown:
+            raise ValueError(f"unsupported Musubi setting(s): {', '.join(sorted(unknown))}")
+        path = Path(hermes_home) / "config.yaml"
+        data = yaml.safe_load(path.read_text()) if path.exists() else {}
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            raise ValueError("Hermes config.yaml must be a mapping")
+        section = data.get("musubi") or {}
+        if not isinstance(section, dict):
+            raise ValueError("Hermes musubi config must be a mapping")
+        data["musubi"] = {**section, **values}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".musubi.tmp")
+        try:
+            with tmp.open("w") as stream:
+                os.chmod(tmp, 0o600)
+                yaml.safe_dump(data, stream, sort_keys=False)
+            tmp.replace(path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
     def backup_paths(self) -> List[str]:
-        home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+        home = self._home or get_hermes_home()
         return [str(Path(home) / "musubi-outbox.db"),
                 str(Path(home) / "metrics" / "musubi.prom")]
+
+
+def register(ctx) -> None:
+    """Hermes' directory-plugin registration entry point."""
+    ctx.register_memory_provider(MusubiMemoryProvider())

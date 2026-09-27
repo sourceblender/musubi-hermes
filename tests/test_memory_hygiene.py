@@ -54,7 +54,7 @@ class MemoryHygieneTests(unittest.TestCase):
 
         self.assertEqual(
             content,
-            "USER: Look.\n\nASSISTANT: [sent a picture: portrait_one.png] and "
+            "USER: Look.\n\nASSISTANT: [sent a picture: example.png] and "
             "[sent a picture: second.webp]",
         )
 
