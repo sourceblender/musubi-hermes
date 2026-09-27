@@ -1,6 +1,6 @@
 [project]
 name = "musubi-hermes"
-version = "0.1.0"
+version = "0.2.0"
 description = "Musubi memory provider plugin for Hermes Agent"
 readme = "README.md"
 license = "MIT"
