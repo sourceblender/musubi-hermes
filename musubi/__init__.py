@@ -877,7 +877,7 @@ class MusubiMemoryProvider(MemoryProvider):
         if not ok:
             logger.warning(
                 "musubi: not configured — need musubi.tenant, musubi.presence and an "
-                "env_file supplying MUSUBI_API_URL + MUSUBI_TOKEN"
+                "API URL and token from the profile scope or a legacy env_file"
             )
             return False
         # Tama, F7: is_available() checked that the strings EXIST, not that they compose
@@ -1646,8 +1646,8 @@ class MusubiMemoryProvider(MemoryProvider):
              "required": True},
             {"key": "env_file", "label": "Path to the per-presence Musubi env (mode 600)",
              "required": False},
-            {"key": "api_url", "label": "Musubi API URL", "required": True},
-            {"key": "token", "label": "Profile-scoped Musubi token", "required": True,
+            {"key": "api_url", "label": "Musubi API URL", "required": False},
+            {"key": "token", "label": "Profile-scoped Musubi token", "required": False,
              "secret": True, "env_var": "MUSUBI_TOKEN"},
             {"key": "recall_guidance", "label": "Seat-specific recall guidance",
              "required": False},

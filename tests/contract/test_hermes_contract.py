@@ -262,6 +262,7 @@ def test_recall_guidance_defaults_to_nylas_text_and_is_configurable(home, no_net
         assert NYLA_GUIDANCE_MARK not in block
         assert "durable long-term memory" in block
         assert "musubi_remember" in block
+        assert "only real once it is verified" in block
         assert "queued" in block and "FAILED" in block
     finally:
         provider.shutdown()

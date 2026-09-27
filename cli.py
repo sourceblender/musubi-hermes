@@ -9,6 +9,7 @@ from .musubi import Outbox
 
 def _run(args) -> None:
     if args.musubi_command != "status":
+        args.musubi_parser.print_help()
         return
     path = get_hermes_home() / "musubi-outbox.db"
     if not path.exists():
@@ -20,4 +21,4 @@ def _run(args) -> None:
 def register_cli(subparser) -> None:
     commands = subparser.add_subparsers(dest="musubi_command")
     commands.add_parser("status", help="Show durable Musubi outbox health")
-    subparser.set_defaults(func=_run)
+    subparser.set_defaults(func=_run, musubi_parser=subparser)
